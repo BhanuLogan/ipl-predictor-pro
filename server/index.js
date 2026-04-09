@@ -1,0 +1,2246 @@
+const dotenv = require("dotenv");
+const axios = require("axios");
+const express = require("express");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { Pool } = require("pg");
+const http = require("http");
+const { Server } = require("socket.io");
+const IPL_SCHEDULE = require("./schedule");
+
+async function isVotingLocked(matchId) {
+  const match = IPL_SCHEDULE.find((m) => m.id === matchId);
+  if (!match) return false;
+  
+  const override = await queryOne("SELECT manual_locked, lock_delay FROM match_overrides WHERE match_id = $1", [matchId]);
+  if (override) {
+    if (override.manual_locked !== null) return override.manual_locked;
+    const now = new Date();
+    const timeStr = match.time || "19:30";
+    const lockTime = new Date(`${match.date}T${timeStr}:00+05:30`);
+    const finalLockTime = new Date(lockTime.getTime() + (override.lock_delay * 60000));
+    return now >= finalLockTime;
+  }
+
+  const now = new Date();
+  const timeStr = match.time || "19:30";
+  const lockTime = new Date(`${match.date}T${timeStr}:00+05:30`);
+  return now >= lockTime;
+}
+
+dotenv.config();
+
+function requireEnv(name) {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} is required`);
+  }
+  return value;
+}
+
+const app = express();
+const PORT = Number(requireEnv("PORT"));
+const JWT_SECRET = requireEnv("JWT_SECRET");
+const ADMIN_PASSWORD = requireEnv("ADMIN_PASSWORD");
+const DATABASE_URL = requireEnv("DATABASE_URL");
+const ADMIN_USERNAME = requireEnv("ADMIN_USERNAME");
+const ADMIN_DEFAULT_PW = requireEnv("ADMIN_DEFAULT_PW");
+
+if (Number.isNaN(PORT)) {
+  throw new Error("PORT must be a valid number");
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("localhost")
+    ? false
+    : { rejectUnauthorized: false },
+});
+
+async function query(sql, params = []) {
+  const result = await pool.query(sql, params);
+  return result.rows;
+}
+
+async function queryOne(sql, params = []) {
+  const rows = await query(sql, params);
+  return rows.length > 0 ? rows[0] : null;
+}
+
+async function initDb() {
+  // ── Rooms ──
+  await query(`
+    CREATE TABLE IF NOT EXISTS rooms (
+      id SERIAL PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      invite_code TEXT UNIQUE NOT NULL,
+      created_by INTEGER, -- will add FK later
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS room_members (
+      room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL, -- will add FK later
+      joined_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (room_id, user_id)
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      is_admin BOOLEAN DEFAULT FALSE,
+      profile_pic TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Add FKs if they weren't added (for existing rooms table)
+  await query(`
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'rooms_created_by_fkey') THEN
+        ALTER TABLE rooms ADD CONSTRAINT rooms_created_by_fkey FOREIGN KEY (created_by) REFERENCES users(id);
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'room_members_user_id_fkey') THEN
+        ALTER TABLE room_members ADD CONSTRAINT room_members_user_id_fkey FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+      END IF;
+    END $$;
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS votes (
+      id SERIAL PRIMARY KEY,
+      match_id TEXT NOT NULL,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      room_id INTEGER REFERENCES rooms(id) ON DELETE CASCADE,
+      prediction TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Explicitly add room_id column if it doesn't exist (for existing votes table)
+  await query(`
+    ALTER TABLE votes ADD COLUMN IF NOT EXISTS room_id INTEGER REFERENCES rooms(id) ON DELETE CASCADE;
+  `);
+
+  // Ensure STAGS room exists for migration
+  await query(`
+    INSERT INTO rooms (name, invite_code)
+    VALUES ('STAGS', 'STAGS1')
+    ON CONFLICT (name) DO NOTHING
+  `);
+
+  const stagsRoom = await queryOne("SELECT id FROM rooms WHERE name = 'STAGS' LIMIT 1");
+  if (stagsRoom) {
+    await query(`UPDATE votes SET room_id = $1 WHERE room_id IS NULL`, [stagsRoom.id]);
+  }
+
+  // Ensure unique constraint on (match_id, user_id, room_id)
+  await query(`
+    ALTER TABLE votes DROP CONSTRAINT IF EXISTS votes_match_id_user_id_key;
+    DO $$ 
+    BEGIN 
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'votes_room_match_user_unique') THEN
+        ALTER TABLE votes ADD CONSTRAINT votes_room_match_user_unique UNIQUE(match_id, user_id, room_id);
+      END IF;
+    END $$;
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS results (
+      match_id TEXT PRIMARY KEY,
+      winner TEXT NOT NULL,
+      score_summary TEXT,
+      toss TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await query(`ALTER TABLE results ADD COLUMN IF NOT EXISTS toss TEXT;`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id SERIAL PRIMARY KEY,
+      room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+      match_id TEXT NOT NULL,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      message TEXT NOT NULL,
+      reply_to_id INTEGER REFERENCES chat_messages(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER REFERENCES chat_messages(id) ON DELETE SET NULL;`);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS match_overrides (
+      match_id TEXT PRIMARY KEY,
+      manual_locked BOOLEAN DEFAULT NULL,
+      lock_delay INTEGER DEFAULT 0
+    );
+  `);
+
+  await query(`CREATE INDEX IF NOT EXISTS idx_chat_room_match ON chat_messages(room_id, match_id);`);
+
+  // Bot columns & reactions table
+  await query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS bot_name TEXT;`);
+  await query(`
+    CREATE TABLE IF NOT EXISTS message_reactions (
+      id SERIAL PRIMARY KEY,
+      message_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      emoji TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(message_id, user_id, emoji)
+    );
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_reactions_message ON message_reactions(message_id);`);
+
+  // Bot user (never logs in — used to author bot messages)
+  const botHash = await bcrypt.hash('scorebot_internal_do_not_use', 4);
+  await query(
+    `INSERT INTO users (username, password_hash) VALUES ('scorebot', $1) ON CONFLICT (username) DO NOTHING`,
+    [botHash]
+  );
+  const botRow = await queryOne("SELECT id FROM users WHERE username = 'scorebot'");
+  BOT_USER_ID = botRow?.id || null;
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS announcements (
+      id SERIAL PRIMARY KEY,
+      text TEXT NOT NULL,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  const existing = await queryOne(
+    "SELECT id FROM users WHERE username = $1",
+    [ADMIN_USERNAME]
+  );
+
+  if (!existing) {
+    const hash = bcrypt.hashSync(ADMIN_DEFAULT_PW, 10);
+    await query(
+      "INSERT INTO users (username, password_hash, is_admin) VALUES ($1, $2, TRUE)",
+      [ADMIN_USERNAME, hash]
+    );
+    console.log(`Default admin created: ${ADMIN_USERNAME} / ${ADMIN_DEFAULT_PW}`);
+  }
+
+  // Seed STAGS room creator (now that user might exist)
+  await query(`
+    UPDATE rooms SET created_by = (SELECT id FROM users WHERE username = 'manoharcb' LIMIT 1)
+    WHERE name = 'STAGS' AND created_by IS NULL
+  `);
+
+  // Add all existing non-admin users to STAGS (idempotent)
+  await query(`
+    INSERT INTO room_members (room_id, user_id)
+    SELECT r.id, u.id FROM rooms r, users u
+    WHERE r.name = 'STAGS' AND NOT u.is_admin
+    ON CONFLICT DO NOTHING
+  `);
+}
+
+app.use(cors());
+app.use(express.json());
+
+function authMiddleware(req, res, next) {
+  const token = req.headers.authorization?.replace("Bearer ", "");
+  if (!token) return res.status(401).json({ error: "No token" });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+function adminMiddleware(req, res, next) {
+  if (!req.user?.is_admin) return res.status(403).json({ error: "Admin only" });
+  next();
+}
+
+/** ─── Basic API Protection ─── */
+function securityMiddleware(req, res, next) {
+  if (req.headers["x-app-source"] !== "web-app") {
+    return res.status(403).json({ error: "Access denied. Use the official application to perform this action." });
+  }
+  next();
+}
+
+function asyncRoute(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch((err) => {
+      console.error(err);
+      next(err);
+    });
+  };
+}
+
+// ─── Socket.io Setup ───
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+const roomUsers = new Map();
+let BOT_USER_ID = null; // set in initDb
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error("Authentication error"));
+  try {
+    socket.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    next(new Error("Authentication error"));
+  }
+});
+
+io.on("connection", (socket) => {
+  console.log(`User connected: ${socket.user.username}`);
+
+  socket.on("join_chat", ({ roomId, matchId }) => {
+    const roomKey = `chat_${roomId}_${matchId}`;
+    socket.join(roomKey);
+
+    // Track online users
+    if (!roomUsers.has(roomKey)) roomUsers.set(roomKey, new Map());
+    roomUsers.get(roomKey).set(socket.id, {
+      userId: socket.user.id,
+      username: socket.user.username,
+      profile_pic: socket.user.profile_pic
+    });
+
+    // Broadcast list
+    const users = Array.from(roomUsers.get(roomKey).values());
+    io.to(roomKey).emit("online_users", users);
+
+    // Post bot intro if match is live and no intro posted yet
+    postIntroIfNeeded(roomId, matchId).catch(e => console.error('[Bot] Intro error:', e.message));
+
+    console.log(`${socket.user.username} joined ${roomKey}`);
+  });
+
+  socket.on("send_message", async ({ roomId, matchId, message, replyToId }) => {
+    if (!message || String(message).trim().length === 0) return;
+    const msg = String(message).trim().substring(0, 500);
+
+    // ── /<botName> command ────────────────────────────────────────────────
+    const botName = getBotName(matchId);
+    const botPrefix = `/${botName.toLowerCase()}`;
+    if (msg.toLowerCase().startsWith(botPrefix)) {
+      const query_str = msg.slice(botPrefix.length).trim();
+      // Save the user's question so others can see it
+      try {
+        const saved = await queryOne(`
+          INSERT INTO chat_messages (room_id, match_id, user_id, message, reply_to_id)
+          VALUES ($1, $2, $3, $4, $5)
+          RETURNING id, room_id, match_id, user_id, message, reply_to_id, created_at
+        `, [roomId, matchId, socket.user.id, msg, replyToId || null]);
+        io.to(`chat_${roomId}_${matchId}`).emit("new_message", {
+          ...saved,
+          username: socket.user.username,
+          profile_pic: socket.user.profile_pic,
+        });
+      } catch (e) {
+        console.error("Chat Error (bot query save):", e);
+      }
+      handleBotQuery(roomId, matchId, query_str || 'help', socket.user.username).catch(e =>
+        console.error('[Bot] Query error:', e.message)
+      );
+      return;
+    }
+
+    try {
+      const saved = await queryOne(`
+        INSERT INTO chat_messages (room_id, match_id, user_id, message, reply_to_id)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, room_id, match_id, user_id, message, reply_to_id, created_at
+      `, [roomId, matchId, socket.user.id, msg, replyToId || null]);
+
+      let replyToData = null;
+      if (saved.reply_to_id) {
+        const original = await queryOne(`
+          SELECT m.message, u.username 
+          FROM chat_messages m 
+          JOIN users u ON u.id = m.user_id 
+          WHERE m.id = $1
+        `, [saved.reply_to_id]);
+        if (original) {
+          replyToData = {
+            username: original.username,
+            message: original.message.substring(0, 50).concat(original.message.length > 50 ? "..." : "")
+          };
+        }
+      }
+
+      const payload = {
+        ...saved,
+        username: socket.user.username,
+        profile_pic: socket.user.profile_pic,
+        reply_to_message: replyToData
+      };
+
+      io.to(`chat_${roomId}_${matchId}`).emit("new_message", payload);
+    } catch (e) {
+      console.error("Chat Error:", e);
+    }
+  });
+
+  socket.on("disconnect", () => {
+    console.log(`User disconnected: ${socket.user.username}`);
+    // Cleanup roomUsers
+    for (const [roomKey, usersMap] of roomUsers.entries()) {
+      if (usersMap.has(socket.id)) {
+        usersMap.delete(socket.id);
+        const users = Array.from(usersMap.values());
+        io.to(roomKey).emit("online_users", users);
+      }
+    }
+  });
+});
+
+app.post("/api/register", asyncRoute(async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: "Username and password are required" });
+    }
+
+    const trimmedUsername = username.trim();
+    if (trimmedUsername.length < 2 || trimmedUsername.length > 20) {
+      return res.status(400).json({ error: "Username must be 2-20 characters" });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters" });
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+    const user = await queryOne(
+      `INSERT INTO users (username, password_hash)
+       VALUES ($1, $2)
+       RETURNING id, username, is_admin, profile_pic`,
+      [trimmedUsername, hash]
+    );
+
+    const token = jwt.sign(
+      { id: user.id, username: user.username, is_admin: user.is_admin, profile_pic: user.profile_pic },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    res.json({ token, user });
+  } catch (e) {
+    if (e.code === "23505") {
+      return res.status(400).json({ error: "Username already taken" });
+    }
+    res.status(500).json({ error: "Registration failed" });
+  }
+}));
+
+app.post("/api/login", asyncRoute(async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: "Username and password are required" });
+  }
+
+  const user = await queryOne(
+    "SELECT * FROM users WHERE username = $1",
+    [username.trim()]
+  );
+  if (!user) return res.status(401).json({ error: "Invalid credentials" });
+
+  const valid = await bcrypt.compare(password, user.password_hash);
+  if (!valid) return res.status(401).json({ error: "Invalid credentials" });
+
+  const token = jwt.sign(
+    { id: user.id, username: user.username, is_admin: user.is_admin, profile_pic: user.profile_pic },
+    JWT_SECRET,
+    { expiresIn: "30d" }
+  );
+
+  res.json({
+    token,
+    user: {
+      id: user.id,
+      username: user.username,
+      is_admin: user.is_admin,
+      profile_pic: user.profile_pic,
+    },
+  });
+}));
+
+app.get("/api/me", authMiddleware, asyncRoute(async (req, res) => {
+  const user = await queryOne(
+    "SELECT id, username, is_admin, profile_pic FROM users WHERE id = $1",
+    [req.user.id]
+  );
+  if (!user) return res.status(404).json({ error: "User not found" });
+  res.json(user);
+}));
+
+app.put("/api/me", authMiddleware, asyncRoute(async (req, res) => {
+  const { username, password, profile_pic } = req.body;
+  const updates = [];
+  const params = [req.user.id];
+  let paramIdx = 2;
+
+  if (username) {
+    const trimmed = username.trim();
+    if (trimmed.length < 2 || trimmed.length > 20) {
+      return res.status(400).json({ error: "Username must be 2-20 characters" });
+    }
+    updates.push(`username = $${paramIdx++}`);
+    params.push(trimmed);
+  }
+
+  if (password) {
+    if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+    updates.push(`password_hash = $${paramIdx++}`);
+    params.push(await bcrypt.hash(password, 10));
+  }
+
+  if (profile_pic !== undefined) {
+    updates.push(`profile_pic = $${paramIdx++}`);
+    params.push(profile_pic || null);
+  }
+
+  if (updates.length > 0) {
+    try {
+      await query(`UPDATE users SET ${updates.join(", ")} WHERE id = $1`, params);
+    } catch (e) {
+      if (e.code === "23505") return res.status(400).json({ error: "Username already taken" });
+      throw e;
+    }
+  }
+
+  const updatedUser = await queryOne(
+    "SELECT id, username, is_admin, profile_pic FROM users WHERE id = $1",
+    [req.user.id]
+  );
+
+  const token = jwt.sign(
+    { id: updatedUser.id, username: updatedUser.username, is_admin: updatedUser.is_admin, profile_pic: updatedUser.profile_pic },
+    JWT_SECRET,
+    { expiresIn: "30d" }
+  );
+
+  res.json({ ok: true, token, user: updatedUser });
+}));
+
+app.post("/api/admin/unlock", authMiddleware, asyncRoute(async (req, res) => {
+  const { password } = req.body;
+  if (password !== ADMIN_PASSWORD) {
+    return res.status(403).json({ error: "Wrong admin password" });
+  }
+
+  await query("UPDATE users SET is_admin = TRUE WHERE id = $1", [req.user.id]);
+  const token = jwt.sign({ ...req.user, is_admin: true }, JWT_SECRET, { expiresIn: "30d" });
+  res.json({ token, message: "Admin access granted" });
+}));
+
+app.get("/api/votes", authMiddleware, asyncRoute(async (req, res) => {
+  const { roomId } = req.query;
+  const roomFilter = roomId ? "AND v.room_id = $1" : "";
+  const params = roomId ? [roomId] : [];
+
+  const rows = await query(`
+    SELECT v.match_id, u.username, v.prediction, v.room_id
+    FROM votes v
+    JOIN users u ON v.user_id = u.id
+    WHERE 1=1 ${roomFilter}
+  `, params);
+
+  const grouped = {};
+  for (const r of rows) {
+    if (!grouped[r.match_id]) grouped[r.match_id] = {};
+    const locked = await isVotingLocked(r.match_id);
+    if (!locked && r.username !== req.user.username && !req.user.is_admin) {
+      continue;
+    }
+    grouped[r.match_id][r.username] = r.prediction;
+  }
+  res.json(grouped);
+}));
+
+app.get("/api/vote-counts", asyncRoute(async (req, res) => {
+  const { roomId } = req.query;
+  const roomFilter = roomId ? "WHERE room_id = $1" : "";
+  const params = roomId ? [roomId] : [];
+
+  const rows = await query(`
+    SELECT match_id, prediction, COUNT(*)::int AS cnt
+    FROM votes
+    ${roomFilter}
+    GROUP BY match_id, prediction
+  `, params);
+
+  const grouped = {};
+  for (const r of rows) {
+    if (!grouped[r.match_id]) grouped[r.match_id] = {};
+    const locked = await isVotingLocked(r.match_id);
+    if (locked) {
+      grouped[r.match_id][r.prediction] = r.cnt;
+    } else {
+      grouped[r.match_id]._total = (grouped[r.match_id]._total || 0) + r.cnt;
+    }
+  }
+  res.json(grouped);
+}));
+
+app.post("/api/vote", authMiddleware, securityMiddleware, asyncRoute(async (req, res) => {
+  const { matchId, prediction, roomId } = req.body;
+  if (!matchId || !prediction || !roomId) {
+    return res.status(400).json({ error: "matchId, prediction, and roomId required" });
+  }
+
+  // verify membership
+  const membership = await queryOne("SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2", [roomId, req.user.id]);
+  if (!membership && !req.user.is_admin) {
+    return res.status(403).json({ error: "Not a member of this room" });
+  }
+
+  await query(
+    `INSERT INTO votes (match_id, user_id, prediction, room_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (match_id, user_id, room_id)
+     DO UPDATE SET prediction = EXCLUDED.prediction`,
+    [matchId, req.user.id, prediction, roomId]
+  );
+
+  res.json({ ok: true });
+}));
+
+app.post("/api/vote/bulk", authMiddleware, securityMiddleware, asyncRoute(async (req, res) => {
+  const { matchId, prediction } = req.body;
+  if (!matchId || !prediction) {
+    return res.status(400).json({ error: "matchId and prediction required" });
+  }
+
+  const isLocked = await isVotingLocked(matchId);
+  if (isLocked) {
+    return res.status(400).json({ error: "Voting is locked for this match" });
+  }
+
+  const rooms = await query(
+    "SELECT room_id FROM room_members WHERE user_id = $1",
+    [req.user.id]
+  );
+
+  if (rooms.length === 0) {
+    return res.status(400).json({ error: "You are not a member of any rooms" });
+  }
+
+  const values = rooms.map(r => `('${matchId}', ${req.user.id}, '${prediction}', ${r.room_id})`).join(",");
+
+  await query(`
+    INSERT INTO votes (match_id, user_id, prediction, room_id)
+    VALUES ${values}
+    ON CONFLICT (match_id, user_id, room_id)
+    DO UPDATE SET prediction = EXCLUDED.prediction
+  `);
+
+  res.json({ ok: true, roomCount: rooms.length });
+}));
+
+app.post("/api/admin/vote", authMiddleware, adminMiddleware, securityMiddleware, asyncRoute(async (req, res) => {
+  const { matchId, username, prediction, roomId } = req.body;
+  if (!matchId || !username || !prediction || !roomId) {
+    return res.status(400).json({ error: "matchId, username, prediction, and roomId required" });
+  }
+
+  const user = await queryOne("SELECT id FROM users WHERE username = $1", [username]);
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  await query(
+    `INSERT INTO votes (match_id, user_id, prediction, room_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (match_id, user_id, room_id)
+     DO UPDATE SET prediction = EXCLUDED.prediction`,
+    [matchId, user.id, prediction, roomId]
+  );
+
+  res.json({ ok: true });
+}));
+
+app.post("/api/admin/delete-vote", authMiddleware, adminMiddleware, asyncRoute(async (req, res) => {
+  const { matchId, username, roomId } = req.body;
+  if (!matchId || !username || !roomId) {
+    return res.status(400).json({ error: "matchId, username, and roomId required" });
+  }
+
+  const user = await queryOne("SELECT id FROM users WHERE username = $1", [username]);
+  if (!user) return res.status(404).json({ error: "User not found" });
+
+  await query("DELETE FROM votes WHERE match_id = $1 AND user_id = $2 AND room_id = $3", [matchId, user.id, roomId]);
+  res.json({ ok: true });
+}));
+
+app.post("/api/admin/set-password", authMiddleware, adminMiddleware, asyncRoute(async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Username and password required" });
+  if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+  
+  const user = await queryOne("SELECT id FROM users WHERE username = $1", [username]);
+  if (!user) return res.status(404).json({ error: "User not found" });
+  
+  const hash = await bcrypt.hash(password, 10);
+  await query("UPDATE users SET password_hash = $1 WHERE id = $2", [hash, user.id]);
+  
+  res.json({ ok: true });
+}));
+
+app.post("/api/admin/reset", authMiddleware, adminMiddleware, asyncRoute(async (req, res) => {
+  await query("DELETE FROM votes");
+  await query("DELETE FROM results");
+  res.json({ ok: true, message: "All votes and results cleared" });
+}));
+
+app.post("/api/admin/sync-results", authMiddleware, adminMiddleware, asyncRoute(async (req, res) => {
+  const result = await checkRecentMatches(true);
+  res.json(result);
+}));
+
+app.get("/api/results", asyncRoute(async (req, res) => {
+  const rows = await query("SELECT match_id, winner, score_summary, toss FROM results");
+  const map = {};
+  for (const r of rows) {
+    map[r.match_id] = {
+      winner: r.winner,
+      scoreSummary: r.score_summary || null,
+      toss: r.toss || null,
+    };
+  }
+  res.json(map);
+}));
+
+app.post("/api/result", authMiddleware, adminMiddleware, asyncRoute(async (req, res) => {
+  const { matchId, winner, scoreSummary } = req.body;
+  if (!matchId) return res.status(400).json({ error: "matchId required" });
+
+  if (!winner) {
+    await query("DELETE FROM results WHERE match_id = $1", [matchId]);
+  } else {
+    const summary =
+      scoreSummary !== undefined && scoreSummary !== "" ? scoreSummary : null;
+    await query(
+      `INSERT INTO results (match_id, winner, score_summary)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (match_id)
+       DO UPDATE SET
+         winner = EXCLUDED.winner,
+         score_summary = CASE
+           WHEN EXCLUDED.score_summary IS NOT NULL THEN EXCLUDED.score_summary
+           ELSE results.score_summary
+         END`,
+      [matchId, winner, summary]
+    );
+
+    // Clear chat history for this match as it's now completed
+    await query("DELETE FROM chat_messages WHERE match_id = $1", [matchId]);
+  }
+
+  res.json({ ok: true });
+}));
+
+function computeUserTimingStats(voteRows) {
+  if (!voteRows || voteRows.length === 0) return {};
+
+  const matchMap = new Map(IPL_SCHEDULE.map((m) => [m.id, m]));
+  const byUser = new Map();
+
+  for (const row of voteRows) {
+    const match = matchMap.get(row.match_id);
+    if (!match) continue;
+    const createdAt = new Date(row.created_at);
+    if (Number.isNaN(createdAt.getTime())) continue;
+    const lockTime = new Date(`${match.date}T${match.time}:00+05:30`);
+    const diffMinutes = Math.abs((lockTime.getTime() - createdAt.getTime()) / 60000);
+
+    let stats = byUser.get(row.user_id);
+    if (!stats) {
+      stats = {
+        totalDiff: 0,
+        count: 0,
+        firstVoteAt: createdAt,
+      };
+      byUser.set(row.user_id, stats);
+    }
+    stats.totalDiff += diffMinutes;
+    stats.count += 1;
+    if (createdAt < stats.firstVoteAt) {
+      stats.firstVoteAt = createdAt;
+    }
+  }
+
+  const out = {};
+  for (const [userId, stats] of byUser.entries()) {
+    out[userId] = {
+      nrr: stats.count > 0 ? stats.totalDiff / stats.count : null,
+      firstVoteAt: stats.firstVoteAt,
+    };
+  }
+  return out;
+}
+
+async function getLeaderboardInternal() {
+  const board = await query(`
+    SELECT
+      u.id AS user_id,
+      u.username,
+      u.profile_pic,
+      COALESCE(SUM(
+        CASE
+          WHEN r.winner IS NULL THEN 0
+          WHEN r.winner IN ('nr', 'draw') THEN 1
+          WHEN v.prediction = r.winner THEN 2
+          ELSE 0
+        END
+      ), 0)::int AS points,
+      COALESCE(SUM(
+        CASE WHEN r.winner IN ('nr', 'draw') THEN 1 ELSE 0 END
+      ), 0)::int AS nr,
+      COALESCE(SUM(
+        CASE WHEN r.winner IS NOT NULL AND r.winner NOT IN ('nr', 'draw') AND v.prediction = r.winner THEN 1 ELSE 0 END
+      ), 0)::int AS correct,
+      COALESCE(COUNT(r.match_id), 0)::int AS voted,
+      (SELECT COUNT(*)::int FROM results) AS matches
+    FROM users u
+    LEFT JOIN votes v ON v.user_id = u.id
+    LEFT JOIN results r ON r.match_id = v.match_id
+    GROUP BY u.id, u.username, u.profile_pic
+  `);
+
+  const voteRows = await query(
+    `SELECT user_id, match_id, created_at
+     FROM votes`
+  );
+  const timing = computeUserTimingStats(voteRows);
+
+  const enriched = board.map((row) => {
+    const t = timing[row.user_id] || {};
+    return {
+      ...row,
+      nrr: t.nrr ?? null,
+      first_vote_at: t.firstVoteAt ? t.firstVoteAt.toISOString() : null,
+    };
+  });
+
+  enriched.sort((a, b) => {
+    if (b.points !== a.points) return b.points - a.points;
+    if (b.correct !== a.correct) return b.correct - a.correct;
+    const valA = a.nrr ?? -Infinity;
+    const valB = b.nrr ?? -Infinity;
+    if (valB !== valA) return valB - valA;
+    return a.username.localeCompare(b.username);
+  });
+
+  return enriched;
+}
+
+app.get("/api/leaderboard", asyncRoute(async (req, res) => {
+  const enriched = await getLeaderboardInternal();
+  res.json(enriched);
+}));
+
+app.get("/api/last-poll-summary", authMiddleware, asyncRoute(async (req, res) => {
+  // 1. Get the latest match with a result
+  const lastResult = await queryOne(`
+    SELECT r.match_id, r.winner, r.score_summary, r.created_at
+    FROM results r
+    ORDER BY r.created_at DESC
+    LIMIT 1
+  `);
+
+  if (!lastResult) {
+    return res.json({ noData: true });
+  }
+
+  const matchId = lastResult.match_id;
+  const match = IPL_SCHEDULE.find(m => m.id === matchId);
+  if (!match) return res.json({ noData: true });
+
+  // 2. Get votes for this match
+  const votes = await query(`
+    SELECT v.user_id, u.username, v.prediction
+    FROM votes v
+    JOIN users u ON v.user_id = u.id
+    WHERE v.match_id = $1
+  `, [matchId]);
+
+  const winners = votes.filter(v => v.prediction === lastResult.winner).map(v => v.username);
+  
+  // 3. User specific status
+  const userVote = votes.find(v => v.user_id === req.user.id);
+  const isCorrect = userVote && (
+    userVote.prediction === lastResult.winner || 
+    (['nr', 'draw'].includes(lastResult.winner))
+  );
+  
+  const userStatus = userVote 
+    ? (isCorrect ? 'won' : 'lost')
+    : 'no_vote';
+
+  // 4. Rank Change Calculation for ALL users in this match
+  const currentBoard = await getLeaderboardInternal();
+  
+  // Previous points calculation for all users
+  const prevBoard = currentBoard.map(user => {
+    // Only subtract if they voted in THIS match
+    const vote = votes.find(v => v.user_id === user.user_id);
+    let pointsGained = 0;
+    let correctGained = 0;
+    if (vote) {
+      if (lastResult.winner === 'nr' || lastResult.winner === 'draw') {
+        pointsGained = 1;
+      } else if (vote.prediction === lastResult.winner) {
+        pointsGained = 2;
+        correctGained = 1;
+      }
+    }
+    return {
+      ...user,
+      points: user.points - pointsGained,
+      correct: user.correct - correctGained,
+      voted: user.voted - (vote ? 1 : 0)
+    };
+  });
+
+  // Re-sort previous board to get previous ranks
+  prevBoard.sort((a, b) => {
+    if (b.points !== a.points) return b.points - a.points;
+    if (b.correct !== a.correct) return b.correct - a.correct;
+    const valA = a.nrr ?? -Infinity;
+    const valB = b.nrr ?? -Infinity;
+    if (valB !== valA) return valB - valA;
+    return a.username.localeCompare(b.username);
+  });
+
+  const getRank = (board, userId) => {
+    const idx = board.findIndex(u => u.user_id === userId);
+    return idx === -1 ? board.length : idx + 1;
+  };
+
+  const currentRank = getRank(currentBoard, req.user.id);
+  const prevRank = getRank(prevBoard, req.user.id);
+  const pointsGained = (userVote && (lastResult.winner === 'nr' || lastResult.winner === 'draw')) 
+    ? 1 
+    : (userVote && userVote.prediction === lastResult.winner ? 2 : 0);
+
+  // User outcomes for everyone who participated
+  const userOutcomes = votes.map(v => {
+    const cRank = getRank(currentBoard, v.user_id);
+    const pRank = getRank(prevBoard, v.user_id);
+    const correct = v.prediction === lastResult.winner || ['nr', 'draw'].includes(lastResult.winner);
+    return {
+      username: v.username,
+      prediction: v.prediction,
+      status: correct ? 'won' : 'lost',
+      currentRank: cRank,
+      prevRank: pRank,
+      rankChange: pRank - cRank
+    };
+  });
+
+  res.json({
+    matchId,
+    team1: match.team1,
+    team2: match.team2,
+    winner: lastResult.winner,
+    scoreSummary: lastResult.score_summary,
+    userVote: userVote ? userVote.prediction : null,
+    userStatus,
+    pointsGained,
+    currentRank,
+    prevRank,
+    rankChange: prevRank - currentRank,
+    userOutcomes,
+    totalVoters: votes.length
+  });
+}));
+
+app.get("/api/users", asyncRoute(async (req, res) => {
+  const users = await query("SELECT id, username FROM users ORDER BY username ASC");
+  res.json(users);
+}));
+
+/** Logged-in users: another user's vote history (for leaderboard profile tap). */
+app.get("/api/users/:username/predictions", authMiddleware, asyncRoute(async (req, res) => {
+  const username = String(req.params.username || "").trim();
+  if (!username) return res.status(400).json({ error: "username required" });
+  const target = await queryOne("SELECT id FROM users WHERE username = $1", [username]);
+  if (!target) return res.status(404).json({ error: "User not found" });
+  const { roomId } = req.query;
+  const roomFilter = roomId ? "AND v.room_id = $2" : "";
+  const params = roomId ? [target.id, roomId] : [target.id];
+
+  const rows = await query(
+    `SELECT v.match_id AS "matchId", v.prediction, r.winner AS outcome
+     FROM votes v
+     LEFT JOIN results r ON r.match_id = v.match_id
+     WHERE v.user_id = $1 ${roomFilter}
+     ORDER BY v.match_id ASC`,
+    params
+  );
+
+  const votesResult = [];
+  for (const r of rows) {
+    const isOwner = target.id === req.user.id;
+    const isAdmin = req.user.is_admin;
+    const locked = await isVotingLocked(r.matchId);
+    
+    // If the match hasn't started yet, hide the prediction from others
+    if (!locked && !isOwner && !isAdmin) {
+      votesResult.push({ ...r, prediction: "HIDDEN" });
+    } else {
+      votesResult.push(r);
+    }
+  }
+  res.json({ votes: votesResult });
+}));
+
+// ─── Room routes ────────────────────────────────────────────────────────────
+
+function generateInviteCode() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+// Create room
+app.post("/api/rooms", authMiddleware, asyncRoute(async (req, res) => {
+  const { name } = req.body;
+  if (!name || name.trim().length < 2) {
+    return res.status(400).json({ error: "Room name must be at least 2 characters" });
+  }
+  try {
+    const room = await queryOne(
+      `INSERT INTO rooms (name, invite_code, created_by)
+       VALUES ($1, $2, $3)
+       RETURNING id, name, invite_code`,
+      [name.trim(), generateInviteCode(), req.user.id]
+    );
+    await query(
+      `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [room.id, req.user.id]
+    );
+    res.json(room);
+  } catch (e) {
+    if (e.code === "23505") return res.status(400).json({ error: "Room name already taken" });
+    throw e;
+  }
+}));
+
+// Join room by invite code
+app.post("/api/rooms/join", authMiddleware, asyncRoute(async (req, res) => {
+  const { inviteCode } = req.body;
+  if (!inviteCode) return res.status(400).json({ error: "Invite code required" });
+  const room = await queryOne(
+    "SELECT id, name, invite_code FROM rooms WHERE UPPER(invite_code) = UPPER($1)",
+    [inviteCode.trim()]
+  );
+  if (!room) return res.status(404).json({ error: "Invalid invite code" });
+  await query(
+    `INSERT INTO room_members (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+    [room.id, req.user.id]
+  );
+  res.json({ room });
+}));
+
+// My rooms
+app.get("/api/rooms/mine", authMiddleware, asyncRoute(async (req, res) => {
+  const rooms = await query(`
+    SELECT r.id, r.name, r.invite_code, r.created_by,
+           COUNT(rm2.user_id)::int AS member_count
+    FROM rooms r
+    JOIN room_members rm  ON rm.room_id  = r.id AND rm.user_id = $1
+    JOIN room_members rm2 ON rm2.room_id = r.id
+    GROUP BY r.id, r.name, r.invite_code, r.created_by
+    ORDER BY r.name ASC
+  `, [req.user.id]);
+  res.json(rooms);
+}));
+
+// Room leaderboard — register BEFORE /:id to avoid route conflict
+app.get("/api/rooms/:id/leaderboard", authMiddleware, asyncRoute(async (req, res) => {
+  const roomId = parseInt(req.params.id);
+  if (isNaN(roomId)) return res.status(400).json({ error: "Invalid room id" });
+  const member = await queryOne(
+    "SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2",
+    [roomId, req.user.id]
+  );
+  if (!member && !req.user.is_admin) return res.status(403).json({ error: "Not a member of this room" });
+  const room = await queryOne("SELECT created_at FROM rooms WHERE id = $1", [roomId]);
+  if (!room) return res.status(404).json({ error: "Room not found" });
+
+  const board = await query(`
+    SELECT
+      u.id AS user_id,
+      u.username,
+      u.profile_pic,
+      COALESCE(SUM(
+        CASE
+          WHEN r.winner IS NULL THEN 0
+          WHEN r.winner IN ('nr','draw') THEN 1
+          WHEN v.prediction = r.winner THEN 2
+          ELSE 0
+        END
+      ), 0)::int AS points,
+      COALESCE(SUM(
+        CASE WHEN r.winner IN ('nr', 'draw') THEN 1 ELSE 0 END
+      ), 0)::int AS nr,
+      COALESCE(SUM(
+        CASE WHEN r.winner IS NOT NULL AND r.winner NOT IN ('nr', 'draw') AND v.prediction = r.winner THEN 1 ELSE 0 END
+      ), 0)::int AS correct,
+      COALESCE(COUNT(r.match_id), 0)::int AS voted,
+      (SELECT COUNT(*)::int FROM results) AS matches
+    FROM users u
+    JOIN room_members rm ON rm.user_id = u.id AND rm.room_id = $1
+    LEFT JOIN votes v ON v.user_id = u.id AND v.room_id = $1 AND v.created_at >= $2
+    LEFT JOIN results r ON r.match_id = v.match_id
+    GROUP BY u.id, u.username, u.profile_pic
+  `, [roomId, room.created_at]);
+
+  const userIds = board.map((b) => b.user_id);
+  let timing = {};
+  if (userIds.length > 0) {
+    const voteRows = await query(
+      `SELECT user_id, match_id, created_at
+       FROM votes
+       WHERE user_id = ANY($1::int[]) AND room_id = $2 AND created_at >= $3`,
+      [userIds, roomId, room.created_at]
+    );
+    timing = computeUserTimingStats(voteRows);
+  }
+
+  const enriched = board.map((row) => {
+    const t = timing[row.user_id] || {};
+    return {
+      ...row,
+      nrr: t.nrr ?? null,
+      first_vote_at: t.firstVoteAt ? t.firstVoteAt.toISOString() : null,
+    };
+  });
+
+  enriched.sort((a, b) => {
+    if (b.points !== a.points) return b.points - a.points;
+    if (b.correct !== a.correct) return b.correct - a.correct;
+    const valA = a.nrr ?? -Infinity;
+    const valB = b.nrr ?? -Infinity;
+    if (valB !== valA) return valB - valA;
+    return a.username.localeCompare(b.username);
+  });
+
+  res.json(enriched);
+}));
+
+// Room details
+app.get("/api/rooms/:id", authMiddleware, asyncRoute(async (req, res) => {
+  const roomId = parseInt(req.params.id);
+  if (isNaN(roomId)) return res.status(400).json({ error: "Invalid room id" });
+  const member = await queryOne(
+    "SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2",
+    [roomId, req.user.id]
+  );
+  if (!member && !req.user.is_admin) return res.status(403).json({ error: "Not a member of this room" });
+  const room = await queryOne("SELECT id, name, invite_code FROM rooms WHERE id = $1", [roomId]);
+  if (!room) return res.status(404).json({ error: "Room not found" });
+  const members = await query(
+    `SELECT u.username FROM users u JOIN room_members rm ON rm.user_id = u.id WHERE rm.room_id = $1 ORDER BY u.username ASC`,
+    [roomId]
+  );
+  res.json({ ...room, members: members.map(m => m.username) });
+}));
+
+// Get chat history
+app.get("/api/rooms/:roomId/chat/:matchId", authMiddleware, asyncRoute(async (req, res) => {
+  const { roomId, matchId } = req.params;
+  
+  // Verify membership
+  const membership = await queryOne("SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2", [roomId, req.user.id]);
+  if (!membership && !req.user.is_admin) {
+    return res.status(403).json({ error: "Not a member of this room" });
+  }
+
+  const messages = await query(`
+    SELECT
+      m.id, m.room_id, m.match_id, m.user_id, m.message, m.bot_name, m.created_at, m.reply_to_id,
+      CASE WHEN m.bot_name IS NOT NULL THEN m.bot_name ELSE u.username END AS username,
+      u.profile_pic,
+      r.message AS reply_message, ru.username AS reply_username
+    FROM chat_messages m
+    JOIN users u ON u.id = m.user_id
+    LEFT JOIN chat_messages r ON r.id = m.reply_to_id
+    LEFT JOIN users ru ON ru.id = r.user_id
+    WHERE m.room_id = $1 AND m.match_id = $2
+    ORDER BY m.created_at ASC
+    LIMIT 200
+  `, [roomId, matchId]);
+
+  // Attach reactions
+  const messageIds = messages.map(m => m.id);
+  let reactionsMap = {};
+  if (messageIds.length > 0) {
+    const reactions = await query(`
+      SELECT mr.message_id, mr.emoji, COUNT(*)::int AS count,
+        array_agg(mr.user_id) AS user_ids,
+        array_agg(u.username) AS usernames
+      FROM message_reactions mr
+      JOIN users u ON u.id = mr.user_id
+      WHERE mr.message_id = ANY($1)
+      GROUP BY mr.message_id, mr.emoji
+    `, [messageIds]);
+    for (const r of reactions) {
+      if (!reactionsMap[r.message_id]) reactionsMap[r.message_id] = [];
+      reactionsMap[r.message_id].push({ emoji: r.emoji, count: r.count, userIds: r.user_ids || [], usernames: r.usernames || [] });
+    }
+  }
+
+  const formatted = messages.map(m => ({
+    id: m.id,
+    room_id: m.room_id,
+    match_id: m.match_id,
+    user_id: m.user_id,
+    message: m.message,
+    bot_name: m.bot_name || null,
+    is_bot: !!m.bot_name,
+    created_at: m.created_at,
+    username: m.username,
+    profile_pic: m.profile_pic,
+    reply_to_message: m.reply_message ? {
+      username: m.reply_username,
+      message: m.reply_message.substring(0, 50).concat(m.reply_message.length > 50 ? '...' : '')
+    } : null,
+    reactions: reactionsMap[m.id] || [],
+  }));
+
+  res.json(formatted);
+}));
+
+// Delete room (creator or admin)
+app.delete("/api/rooms/:id", authMiddleware, asyncRoute(async (req, res) => {
+  const roomId = parseInt(req.params.id);
+  if (isNaN(roomId)) return res.status(400).json({ error: "Invalid room id" });
+  const room = await queryOne("SELECT id, created_by FROM rooms WHERE id = $1", [roomId]);
+  if (!room) return res.status(404).json({ error: "Room not found" });
+  if (!req.user.is_admin && room.created_by !== req.user.id) {
+    return res.status(403).json({ error: "Only the room creator or admin can delete this room" });
+  }
+  await query("DELETE FROM rooms WHERE id = $1", [roomId]);
+  res.json({ ok: true });
+}));
+
+// Admin: view all rooms
+app.get("/api/admin/rooms", authMiddleware, adminMiddleware, asyncRoute(async (req, res) => {
+  const rooms = await query(`
+    SELECT r.id, r.name, r.invite_code,
+           u.username AS created_by_username,
+           COUNT(rm.user_id)::int AS member_count
+    FROM rooms r
+    LEFT JOIN users u ON u.id = r.created_by
+    LEFT JOIN room_members rm ON rm.room_id = r.id
+    GROUP BY r.id, r.name, r.invite_code, u.username
+    ORDER BY r.name ASC
+  `);
+  res.json(rooms);
+}));
+
+// Admin: Set match override
+app.post("/api/admin/match-override", authMiddleware, adminMiddleware, asyncRoute(async (req, res) => {
+  const { matchId, manual_locked, lock_delay } = req.body;
+  if (!matchId) return res.status(400).json({ error: "matchId required" });
+
+  await query(`
+    INSERT INTO match_overrides (match_id, manual_locked, lock_delay)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (match_id)
+    DO UPDATE SET 
+      manual_locked = EXCLUDED.manual_locked,
+      lock_delay = EXCLUDED.lock_delay
+  `, [matchId, manual_locked === undefined ? null : manual_locked, lock_delay || 0]);
+
+  res.json({ ok: true });
+}));
+
+// Admin: Set announcement
+app.post("/api/admin/announcements", authMiddleware, adminMiddleware, asyncRoute(async (req, res) => {
+  const { text } = req.body;
+  if (text === undefined) return res.status(400).json({ error: "text required" });
+
+  await query("UPDATE announcements SET is_active = FALSE");
+  if (text.trim()) {
+    await query("INSERT INTO announcements (text) VALUES ($1)", [text.trim()]);
+  }
+  res.json({ ok: true });
+}));
+
+// Admin: Clear announcements
+app.delete("/api/admin/announcements", authMiddleware, adminMiddleware, asyncRoute(async (req, res) => {
+  await query("UPDATE announcements SET is_active = FALSE");
+  res.json({ ok: true });
+}));
+
+// Get active announcement
+app.get("/api/announcements", asyncRoute(async (req, res) => {
+  const row = await queryOne("SELECT text FROM announcements WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 1");
+  res.json(row || { text: "" });
+}));
+
+// Get all overrides
+app.get("/api/match-overrides", authMiddleware, asyncRoute(async (req, res) => {
+  const rows = await query("SELECT * FROM match_overrides");
+  res.json(rows);
+}));
+
+// ─── Automated Result Service (Cricbuzz API) ───────────────────────────────
+
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
+const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || "cricbuzz-cricket.p.rapidapi.com";
+/** IPL series on Cricbuzz (RapidAPI). Override if the tournament id changes year to year. */
+const RAPIDAPI_SERIES_ID = process.env.RAPIDAPI_SERIES_ID || "9241";
+
+const TEAM_NAME_MAP = {
+  "Chennai Super Kings": "CSK",
+  "Mumbai Indians": "MI",
+  "Royal Challengers Bengaluru": "RCB",
+  "Royal Challengers Bangalore": "RCB",
+  "Kolkata Knight Riders": "KKR",
+  "Delhi Capitals": "DC",
+  "Punjab Kings": "PBKS",
+  "Rajasthan Royals": "RR",
+  "Sunrisers Hyderabad": "SRH",
+  "Gujarat Titans": "GT",
+  "Lucknow Super Giants": "LSG",
+};
+
+/**
+ * Normalizes team names for fuzzy matching
+ */
+function normalizeTeam(name) {
+  return name.toLowerCase().replace(/[^a-z]/g, "");
+}
+
+/**
+ * Finds the Cricbuzz winner from the API response status string
+ * Example: "RCB won by 20 runs" -> "RCB"
+ */
+function parseWinnerFromStatus(status, team1Code, team2Code) {
+  if (!status) return null;
+  const s = status.toLowerCase();
+  
+  // Direct match code check
+  if (s.includes(team1Code.toLowerCase())) return team1Code;
+  if (s.includes(team2Code.toLowerCase())) return team2Code;
+  
+  // Full name check
+  for (const [fullName, code] of Object.entries(TEAM_NAME_MAP)) {
+    if (s.includes(fullName.toLowerCase())) return code;
+  }
+  
+  if (s.includes("draw") || s.includes("tied") || s.includes("no result") || s.includes("abandoned")) {
+    return "nr";
+  }
+  
+  return null;
+}
+
+/** Short score line from Cricbuzz matchInfo (status text usually includes full summary). */
+function extractScoreSummary(matchInfo) {
+  if (!matchInfo) return null;
+  const st = (matchInfo.status || "").trim();
+  if (st) return st;
+  const t1 = matchInfo.team1;
+  const t2 = matchInfo.team2;
+  if (!t1 || !t2) return null;
+  const shortName = (t) =>
+    t.teamSName ||
+    (typeof t.teamName === "string" && t.teamName.split(/\s+/).map((w) => w[0]).join("")) ||
+    "?";
+  const fmt = (t) => {
+    if (t == null) return null;
+    if (typeof t.score === "string" && t.score.length > 0 && t.score !== "-1") {
+      return `${shortName(t)} ${t.score}`;
+    }
+    if (t.score != null && Number(t.score) >= 0 && Number(t.score) !== -1) {
+      const wk = t.wickets != null ? t.wickets : 0;
+      const ov = t.overs ?? t.oversText ?? t.overNbr ?? "—";
+      return `${shortName(t)} ${t.score}/${wk} (${ov})`;
+    }
+    return null;
+  };
+  const a = fmt(t1);
+  const b = fmt(t2);
+  if (a && b) return `${a} · ${b}`;
+  return null;
+}
+
+/** Extracts toss info from matchInfo.tossResults → e.g. "KKR won the toss and chose to bat" */
+function extractTossInfo(matchInfo) {
+  const toss = matchInfo?.tossResults;
+  if (!toss || !toss.tossWinnerName) return null;
+  const winner = TEAM_NAME_MAP[toss.tossWinnerName] || toss.tossWinnerName;
+  const decision = toss.decision === 'bat' ? 'bat' : 'bowl';
+  return `${winner} won the toss and chose to ${decision}`;
+}
+
+/** Fetches all IPL matches from Cricbuzz unofficial API (live + recent). No key required. */
+async function fetchCricbuzzAll() {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://www.cricbuzz.com/',
+    'Origin': 'https://www.cricbuzz.com',
+  };
+  const [liveResp, recentResp] = await Promise.all([
+    axios.get('https://www.cricbuzz.com/api/cricket-match/live', { headers, timeout: 10000 }),
+    axios.get('https://www.cricbuzz.com/api/cricket-match/recent', { headers, timeout: 10000 }),
+  ]);
+  const live = collectCricbuzzMatchesFromPayload(liveResp.data);
+  const recent = collectCricbuzzMatchesFromPayload(recentResp.data);
+  return dedupeCricbuzzMatches([...live, ...recent]);
+}
+
+/**
+ * Flattens match list objects from /series/v1/:id or /matches/v1/recent style payloads.
+ */
+function collectCricbuzzMatchesFromPayload(data) {
+  if (!data || typeof data !== "object") return [];
+
+  const fromTypeMatches = [];
+  const typeMatches = data.typeMatches || [];
+  typeMatches.forEach((type) => {
+    type.seriesMatches?.forEach((series) => {
+      const matches = series.seriesAdWrapper?.matches || series.matches;
+      if (matches) fromTypeMatches.push(...matches);
+    });
+  });
+  if (fromTypeMatches.length > 0) return dedupeCricbuzzMatches(fromTypeMatches);
+
+  const fromWalk = [];
+  function walk(node) {
+    if (!node || typeof node !== "object") return;
+    const mi = node.matchInfo;
+    if (mi?.team1?.teamName && mi?.team2?.teamName && mi.startDate != null) {
+      fromWalk.push(node);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+    } else {
+      for (const v of Object.values(node)) walk(v);
+    }
+  }
+  walk(data);
+  return dedupeCricbuzzMatches(fromWalk);
+}
+
+function dedupeCricbuzzMatches(matches) {
+  const seen = new Set();
+  const out = [];
+  for (const m of matches) {
+    const mi = m.matchInfo;
+    if (!mi) continue;
+    const key =
+      mi.matchId != null
+        ? String(mi.matchId)
+        : `${mi.startDate}-${mi.team1?.teamName}-${mi.team2?.teamName}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(m);
+  }
+  return out;
+}
+
+async function fetchCricbuzzSeriesMatches() {
+  const url = `https://${RAPIDAPI_HOST}/series/v1/${RAPIDAPI_SERIES_ID}`;
+  const response = await axios.request({
+    method: "GET",
+    url,
+    headers: {
+      "X-RapidAPI-Key": RAPIDAPI_KEY,
+      "X-RapidAPI-Host": RAPIDAPI_HOST,
+    },
+  });
+  return collectCricbuzzMatchesFromPayload(response.data);
+}
+
+/** Auto-sync only runs from (match start + 4h) through (match start + 6h), every CHECK_INTERVAL. */
+const HOUR_MS = 60 * 60 * 1000;
+const AUTO_RESULT_CHECK_DELAY_MS = 4 * HOUR_MS;
+const AUTO_RESULT_CHECK_WINDOW_MS = 2 * HOUR_MS;
+
+async function checkRecentMatches(isManual = false) {
+  try {
+    const now = new Date();
+    const nowMs = now.getTime();
+
+    const existingResults = await query("SELECT match_id FROM results");
+    const existingIds = new Set(existingResults.map((r) => r.match_id));
+
+    // Skip if every match at or before now already has a result
+    const needResultSync = IPL_SCHEDULE.some((m) => {
+      const startTime = new Date(`${m.date}T${m.time}:00+05:30`);
+      return nowMs >= startTime.getTime() && !existingIds.has(m.id);
+    });
+    if (!needResultSync) return { updated: 0, checked: 0 };
+
+    // Candidate matches: manual = any time after start; auto only in [start+4h, start+6h]
+    const pendingMatches = IPL_SCHEDULE.filter((m) => {
+      const startTime = new Date(`${m.date}T${m.time}:00+05:30`);
+      if (isManual) return nowMs >= startTime.getTime();
+      const windowStart = startTime.getTime() + AUTO_RESULT_CHECK_DELAY_MS;
+      const windowEnd = windowStart + AUTO_RESULT_CHECK_WINDOW_MS;
+      return nowMs >= windowStart && nowMs <= windowEnd;
+    });
+
+    if (pendingMatches.length === 0) return { updated: 0, checked: 0 };
+
+    const toCheck = pendingMatches.filter(m => !existingIds.has(m.id));
+    if (toCheck.length === 0) return { updated: 0, checked: 0 };
+
+    console.log(`🔍 AutomatedResultService: Checking ${toCheck.length} pending matches via Cricbuzz...`);
+    let updatedCount = 0;
+
+    // Fetch from Cricbuzz unofficial API (live + recent)
+    const allMatches = await fetchCricbuzzAll();
+    if (allMatches.length === 0) {
+      console.log("⚠️  AutomatedResultService: No matches returned from Cricbuzz.");
+    }
+
+    for (const match of toCheck) {
+      const matchDateStr = match.date;
+
+      const apiMatch = allMatches.find(am => {
+        const mi = am.matchInfo;
+        if (!mi?.team1?.teamName || !mi?.team2?.teamName) return false;
+        // Match by date (startDate is Unix ms string) and teams
+        const amDate = mi.startDate
+          ? new Date(parseInt(mi.startDate)).toISOString().split('T')[0]
+          : null;
+        const t1 = TEAM_NAME_MAP[mi.team1.teamName];
+        const t2 = TEAM_NAME_MAP[mi.team2.teamName];
+        const teamsMatch =
+          (t1 === match.team1 && t2 === match.team2) ||
+          (t1 === match.team2 && t2 === match.team1);
+        return (amDate === matchDateStr || !amDate) && teamsMatch;
+      });
+
+      if (!apiMatch) {
+        console.log(`❓ AutomatedResultService: Could not find ${match.id} (${match.team1} vs ${match.team2}) on Cricbuzz.`);
+        continue;
+      }
+
+      const status = apiMatch.matchInfo.status || "";
+      const state = (apiMatch.matchInfo.state || "").toString();
+
+      const stateDone =
+        /^complete|result$/i.test(state) ||
+        status.includes("won by") ||
+        status.includes("Match abandoned");
+
+      if (stateDone) {
+        const winner = parseWinnerFromStatus(status, match.team1, match.team2);
+        if (winner) {
+          const scoreSummary = extractScoreSummary(apiMatch.matchInfo);
+          const toss = extractTossInfo(apiMatch.matchInfo);
+          console.log(`🏆 AutomatedResultService: AUTO-DECLARING WINNER for ${match.id}: ${winner}${toss ? ` | ${toss}` : ''}`);
+          await query(
+            `INSERT INTO results (match_id, winner, score_summary, toss)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (match_id)
+             DO UPDATE SET
+               winner = EXCLUDED.winner,
+               score_summary = COALESCE(EXCLUDED.score_summary, results.score_summary),
+               toss = COALESCE(EXCLUDED.toss, results.toss)`,
+            [match.id, winner, scoreSummary, toss]
+          );
+          await query("DELETE FROM chat_messages WHERE match_id = $1", [match.id]);
+          updatedCount++;
+        }
+      } else {
+        console.log(`⏳ AutomatedResultService: Match ${match.id} still in progress (Status: ${status}).`);
+      }
+    }
+
+    return { updated: updatedCount, checked: toCheck.length };
+
+  } catch (error) {
+    console.error("❌ AutomatedResultService Error:", error.message);
+    return isManual ? { error: error.message } : null;
+  }
+}
+
+// Start the check loop (every 15 minutes; each match is only considered in the 2h window after +4h from start)
+const CHECK_INTERVAL = 15 * 60 * 1000;
+setInterval(checkRecentMatches, CHECK_INTERVAL);
+
+// Initial check on startup
+setTimeout(checkRecentMatches, 5000); // 5 sec delay to let DB init completion
+
+// ─── Live Score Service ────────────────────────────────────────────────────
+
+const liveScoreCache = new Map(); // ourMatchId -> LiveScorePayload
+const commentaryCache = new Map(); // ourMatchId -> { cricbuzzMatchId, lastTs }
+
+function formatScoreFromMatchData(ourMatch, apiMatch) {
+  const { matchInfo, matchScore } = apiMatch;
+  const status = (matchInfo.status || '').trim();
+
+  function scoreStr(teamShort, inngsObj, teamInfoObj) {
+    if (inngsObj && inngsObj.runs != null) {
+      const ov = inngsObj.overs != null ? inngsObj.overs : (inngsObj.overNbr != null ? inngsObj.overNbr : null);
+      return `${teamShort} ${inngsObj.runs}/${inngsObj.wickets ?? 0}${ov != null ? ` (${ov})` : ''}`;
+    }
+    if (teamInfoObj && teamInfoObj.score != null && Number(teamInfoObj.score) >= 0 && Number(teamInfoObj.score) !== -1) {
+      const ov = teamInfoObj.overs ?? teamInfoObj.overNbr ?? teamInfoObj.oversText ?? null;
+      return `${teamShort} ${teamInfoObj.score}/${teamInfoObj.wickets ?? 0}${ov != null ? ` (${ov})` : ''}`;
+    }
+    return null;
+  }
+
+  const t1Short = TEAM_NAME_MAP[matchInfo.team1?.teamName] || matchInfo.team1?.teamSName || ourMatch.team1;
+  const t2Short = TEAM_NAME_MAP[matchInfo.team2?.teamName] || matchInfo.team2?.teamSName || ourMatch.team2;
+
+  const t1Score = scoreStr(t1Short, matchScore?.team1Score?.inngs1, matchInfo.team1) ||
+                  scoreStr(t1Short, matchScore?.team1Score?.inngs2, null);
+  const t2Score = scoreStr(t2Short, matchScore?.team2Score?.inngs1, matchInfo.team2) ||
+                  scoreStr(t2Short, matchScore?.team2Score?.inngs2, null);
+
+  const parts = [t1Score, t2Score].filter(Boolean);
+  return {
+    score: parts.join(' · ') || null,
+    status: status || null,
+    toss: extractTossInfo(matchInfo),
+  };
+}
+
+async function fetchLiveMatchData() {
+  // Cricbuzz unofficial web API — free, no key required
+  const resp = await axios.get('https://www.cricbuzz.com/api/cricket-match/live', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/json',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://www.cricbuzz.com/',
+      'Origin': 'https://www.cricbuzz.com',
+    },
+    timeout: 10000,
+  });
+  return collectCricbuzzMatchesFromPayload(resp.data);
+}
+
+async function pollLiveScores() {
+  try {
+    const now = new Date();
+    const existingResults = await query('SELECT match_id FROM results');
+    const completedIds = new Set(existingResults.map(r => r.match_id));
+
+    // Remove completed matches from cache
+    for (const id of liveScoreCache.keys()) {
+      if (completedIds.has(id)) liveScoreCache.delete(id);
+    }
+
+    // Matches started in the last 4 hours without a result
+    const liveMatches = IPL_SCHEDULE.filter(m => {
+      const startTime = new Date(`${m.date}T${m.time}:00+05:30`);
+      const cutoff = new Date(startTime.getTime() + 4 * 60 * 60 * 1000);
+      return now >= startTime && now <= cutoff && !completedIds.has(m.id);
+    });
+
+    if (liveMatches.length === 0) return;
+
+    const apiMatches = await fetchLiveMatchData();
+
+    for (const match of liveMatches) {
+      const apiMatch = apiMatches.find(am => {
+        const mi = am.matchInfo;
+        if (!mi) return false;
+        const t1 = TEAM_NAME_MAP[mi.team1?.teamName];
+        const t2 = TEAM_NAME_MAP[mi.team2?.teamName];
+        return (t1 === match.team1 && t2 === match.team2) ||
+               (t1 === match.team2 && t2 === match.team1);
+      });
+
+      if (!apiMatch) continue;
+
+      const { score, status, toss } = formatScoreFromMatchData(match, apiMatch);
+
+      // Seed commentaryCache with Cricbuzz match ID (first time we see this match live)
+      const cricbuzzId = apiMatch.matchInfo?.matchId;
+      if (cricbuzzId && !commentaryCache.has(match.id)) {
+        commentaryCache.set(match.id, {
+          cricbuzzMatchId: String(cricbuzzId),
+          lastTs: Date.now() - 120000, // catch last 2 min on first poll
+        });
+        console.log(`[Commentary] Registered match ${match.id} → Cricbuzz ID ${cricbuzzId}`);
+      }
+
+      const payload = {
+        matchId: match.id,
+        team1: match.team1,
+        team2: match.team2,
+        score: score || null,
+        status: status || null,
+        toss: toss || null,
+        updatedAt: new Date().toISOString(),
+      };
+
+      liveScoreCache.set(match.id, payload);
+      io.emit('live_score', payload);
+      console.log(`[LiveScore] ${match.id}: ${score || 'no score'} | ${status || 'no status'}`);
+    }
+  } catch (err) {
+    console.error('[LiveScore] Poll error:', err.message);
+  }
+}
+
+setInterval(pollLiveScores, 30 * 1000);
+setTimeout(pollLiveScores, 10000); // 10s after startup
+
+app.get('/api/live-score', asyncRoute(async (req, res) => {
+  res.json(Object.fromEntries(liveScoreCache));
+}));
+
+// ─── Chatbot System ────────────────────────────────────────────────────────
+
+const BOT_NAMES = [
+  'Siri', 'Nova', 'Luna', 'Aria', 'Zara',
+  'Mira', 'Echo', 'Sage', 'Iris', 'Lyra',
+  'Orion', 'Atlas', 'Vega', 'Cleo', 'Rex',
+];
+
+function getBotName(matchId) {
+  const idx = IPL_SCHEDULE.findIndex(m => m.id === matchId);
+  return BOT_NAMES[Math.abs(idx < 0 ? 0 : idx) % BOT_NAMES.length];
+}
+
+function getBotIntro(botName, matchId) {
+  const match = IPL_SCHEDULE.find(m => m.id === matchId);
+  const t1 = match?.team1 || '?';
+  const t2 = match?.team2 || '?';
+  const idx = IPL_SCHEDULE.findIndex(m => m.id === matchId);
+  const variants = [
+    `Hey everyone! 👋 I'm ${botName}, your AI cricket companion for today's match! 🏏✨\n\n📍 ${t1} vs ${t2} — let the battle begin!\n\nI'll be dropping live ball-by-ball updates right here as the action unfolds:\n\n🔴 Wickets  •  🔵 Fours  •  🏏 Sixes  •  📊 Over summaries\n\nReact to my updates, cheer for your team, and let's make this match unforgettable! 🚀🔥`,
+    `Helloooo cricket lovers! 🦁 The name's ${botName} and I'm your dedicated live score bot for this epic clash!\n\n⚔️ ${t1} vs ${t2} — who's it gonna be?!\n\nI'll fire ball-by-ball commentary straight into this chat as the game unfolds. React with 🔥 for sixes, 👏 for wickets — let's get loud! 🎉\n\nLet's gooooo! 🚀`,
+    `Hi fam! 🙌 I'm ${botName} — think of me as your cricket BFF who never misses a delivery!\n\n${t1} 🆚 ${t2} — this one's going to be a cracker! 💥\n\nEvery four, every six, every heart-stopping wicket — I've got you covered with live updates. Grab your snacks, react to my posts, and let's enjoy the game together! 🍿🏏`,
+    `Greetings, cricket fans! 🏆 I'm ${botName}, your real-time match commentator for today's game!\n\n🏟️ ${t1} vs ${t2} is about to get electric!\n\nMy job? Keep you updated on every single delivery — the big shots, the crucial wickets, the dramatic finishes. Nothing gets past me! ⚡\n\nHit those reaction buttons and let me know how you're feeling! Let's play! 🏏`,
+    `What's up, legends! 😎 ${botName} here — your go-to bot for live IPL action!\n\n🔥 ${t1} vs ${t2} — brace yourselves!\n\nI'll be your eyes on the pitch, sending ball-by-ball updates so you stay in the thick of the action even when life gets busy. React, chat, and enjoy! 🏏✨`,
+  ];
+  return variants[Math.abs(idx < 0 ? 0 : idx) % variants.length];
+}
+
+async function postBotMessage(roomId, matchId, text, botName) {
+  if (!BOT_USER_ID) return null;
+  try {
+    const saved = await queryOne(`
+      INSERT INTO chat_messages (room_id, match_id, user_id, message, bot_name)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id, room_id, match_id, user_id, message, bot_name, created_at
+    `, [roomId, matchId, BOT_USER_ID, text, botName]);
+
+    if (saved) {
+      io.to(`chat_${roomId}_${matchId}`).emit('new_message', {
+        ...saved,
+        username: botName,
+        profile_pic: null,
+        is_bot: true,
+        bot_name: botName,
+        reply_to_message: null,
+        reactions: [],
+      });
+    }
+    return saved;
+  } catch (e) {
+    console.error('[Bot] postBotMessage error:', e.message);
+    return null;
+  }
+}
+
+const introPostedSet = new Set(); // `${roomId}_${matchId}`
+
+async function postIntroIfNeeded(roomId, matchId) {
+  // Only post intro if match has started
+  const match = IPL_SCHEDULE.find(m => m.id === matchId);
+  if (!match) return;
+  const startTime = new Date(`${match.date}T${match.time}:00+05:30`);
+  if (new Date() < startTime) return;
+
+  const key = `${roomId}_${matchId}`;
+  if (introPostedSet.has(key)) return;
+  introPostedSet.add(key); // optimistic lock to avoid double-post
+
+  // Check DB to avoid re-posting after server restart
+  const existing = await queryOne(
+    'SELECT id FROM chat_messages WHERE room_id = $1 AND match_id = $2 AND bot_name IS NOT NULL LIMIT 1',
+    [roomId, matchId]
+  );
+  if (existing) return;
+
+  const botName = getBotName(matchId);
+  await postBotMessage(roomId, matchId, getBotIntro(botName, matchId), botName);
+  console.log(`[Bot] Posted intro for match ${matchId} in room ${roomId} (${botName})`);
+}
+
+// ─── Bot Query Handler ─────────────────────────────────────────────────────
+
+function getHelpText(botName) {
+  const p = `/${botName}`;
+  return `🏏 Hi! I'm ${botName}. Here's what you can ask me:\n\n` +
+    `📊 Match\n` +
+    `${p} score — current score & status\n` +
+    `${p} batting — who's at the crease\n` +
+    `${p} bowling — current bowler's figures\n` +
+    `${p} rr — current run rate\n` +
+    `${p} target — target (2nd innings)\n` +
+    `${p} rrr — required run rate\n` +
+    `${p} overs — overs remaining\n\n` +
+    `🏆 Room\n` +
+    `${p} top — leaderboard top 5\n` +
+    `${p} votes — vote split for this match\n` +
+    `${p} who predicted [team] — who picked a team\n\n` +
+    `🎲 Fun\n` +
+    `${p} win — my prediction for this match`;
+}
+
+async function fetchLatestBallData(matchId) {
+  const state = commentaryCache.get(matchId);
+  if (!state?.cricbuzzMatchId) return null;
+  try {
+    const resp = await axios.get(
+      `https://www.cricbuzz.com/api/cricket-match/${state.cricbuzzMatchId}/full-commentary/1`,
+      { headers: CRICBUZZ_COMMENTARY_HEADERS, timeout: 8000 }
+    );
+    const commentary = resp.data?.commentary || [];
+    // Most recent real delivery (not over separator)
+    const balls = commentary.filter(b => !b.overSeparator && b.batsmanStriker);
+    const latest = balls[0] || null;
+    const miniscore = resp.data?.miniscore || resp.data?.matchScore || null;
+    return { latest, miniscore, commentary };
+  } catch (e) {
+    return null;
+  }
+}
+
+function parseMiniScore(miniscore) {
+  if (!miniscore) return null;
+  const batting = miniscore.batTeam || miniscore.inningScore;
+  if (!batting) return null;
+  const teamName = batting.teamSName || '';
+  const score = batting.score ?? '?';
+  const wickets = batting.wickets ?? 0;
+  const overs = batting.overs ?? '?';
+  const rr = miniscore.currentRunRate != null ? Number(miniscore.currentRunRate).toFixed(2) : null;
+  const rrr = miniscore.requiredRunRate != null ? Number(miniscore.requiredRunRate).toFixed(2) : null;
+  const target = miniscore.target != null ? miniscore.target : null;
+  const ballsLeft = miniscore.remBalls != null ? miniscore.remBalls : null;
+  return { teamName, score, wickets, overs, rr, rrr, target, ballsLeft };
+}
+
+async function handleBotQuery(roomId, matchId, rawQuery, askerUsername) {
+  const q = rawQuery.trim().toLowerCase().replace(/[?!.,]+$/, '');
+  const botName = getBotName(matchId);
+  const liveData = liveScoreCache.get(matchId);
+  const schedule = require('./schedule.js');
+  const matchInfo = schedule.find(m => m.id === matchId);
+  const t1 = matchInfo?.team1 || 'Team 1';
+  const t2 = matchInfo?.team2 || 'Team 2';
+
+  let reply = null;
+
+  // ── help ──────────────────────────────────────────────────────────────────
+  if (['help', 'commands', '?'].includes(q)) {
+    reply = getHelpText(botName);
+  }
+
+  // ── score ─────────────────────────────────────────────────────────────────
+  else if (['score', 'scorecard'].includes(q)) {
+    if (!liveData?.score) {
+      reply = `No live score available for this match right now, ${askerUsername}. Check back once the match starts! 🏏`;
+    } else {
+      reply = `📊 Current Score\n${liveData.score}${liveData.status ? `\n${liveData.status}` : ''}`;
+    }
+  }
+
+  // ── batting ───────────────────────────────────────────────────────────────
+  else if (['batting', 'bat', 'batsman', 'batter', "who's batting", 'who is batting'].includes(q)) {
+    const data = await fetchLatestBallData(matchId);
+    const ball = data?.latest;
+    if (!ball?.batsmanStriker) {
+      reply = liveData?.score
+        ? `🏏 Batting info not available right now. Score: ${liveData.score}`
+        : `No live match data yet, ${askerUsername}!`;
+    } else {
+      const s = ball.batsmanStriker;
+      const ns = ball.batsmanNonStriker;
+      let msg = `🏏 At the Crease\n\n`;
+      msg += `⚡ *Striker:* ${s.batName} — ${s.batRuns ?? 0}* off ${s.batBalls ?? 0} (${s.batFours ?? 0}×4, ${s.batSixes ?? 0}×6)`;
+      if (ns) msg += `\n🔄 *Non-striker:* ${ns.batName} — ${ns.batRuns ?? 0}* off ${ns.batBalls ?? 0}`;
+      reply = msg;
+    }
+  }
+
+  // ── bowling ───────────────────────────────────────────────────────────────
+  else if (['bowling', 'bowl', 'bowler', "who's bowling", 'who is bowling'].includes(q)) {
+    const data = await fetchLatestBallData(matchId);
+    const ball = data?.latest;
+    if (!ball?.bowlerStriker) {
+      reply = `Bowling info not available right now, ${askerUsername}!`;
+    } else {
+      const b = ball.bowlerStriker;
+      reply = `⚾ Current Bowler\n\n${b.bowlName} — ${b.bowlOvs ?? '?'} ov, ${b.bowlRuns ?? 0} runs, ${b.bowlWkts ?? 0} wkts, Econ: ${b.bowlEcon ?? '?'}`;
+    }
+  }
+
+  // ── run rate ─────────────────────────────────────────────────────────────
+  else if (['rr', 'crr', 'run rate', 'current run rate'].includes(q)) {
+    const data = await fetchLatestBallData(matchId);
+    const ms = parseMiniScore(data?.miniscore);
+    if (!ms?.rr) {
+      reply = `Run rate info isn't available yet, ${askerUsername}!`;
+    } else {
+      reply = `📈 Current Run Rate: *${ms.rr}*${ms.teamName ? ` (${ms.teamName}: ${ms.score}/${ms.wickets})` : ''}`;
+    }
+  }
+
+  // ── target ────────────────────────────────────────────────────────────────
+  else if (['target', 'what is the target', "what's the target"].includes(q)) {
+    const data = await fetchLatestBallData(matchId);
+    const ms = parseMiniScore(data?.miniscore);
+    if (!ms?.target) {
+      reply = `No target set yet — either still 1st innings or match hasn't started, ${askerUsername}!`;
+    } else {
+      reply = `🎯 Target: *${ms.target} runs*${ms.teamName ? ` for ${ms.teamName}` : ''}`;
+    }
+  }
+
+  // ── required rate ─────────────────────────────────────────────────────────
+  else if (['rrr', 'required rate', 'required run rate'].includes(q)) {
+    const data = await fetchLatestBallData(matchId);
+    const ms = parseMiniScore(data?.miniscore);
+    if (!ms?.rrr) {
+      reply = `Required run rate isn't available — may still be 1st innings, ${askerUsername}!`;
+    } else {
+      reply = `⚡ Required Run Rate: *${ms.rrr}*${ms.ballsLeft ? ` (${ms.ballsLeft} balls left)` : ''}`;
+    }
+  }
+
+  // ── overs left ────────────────────────────────────────────────────────────
+  else if (['overs', 'overs left', 'overs remaining'].includes(q)) {
+    const data = await fetchLatestBallData(matchId);
+    const ms = parseMiniScore(data?.miniscore);
+    if (ms?.ballsLeft != null) {
+      const oversLeft = Math.floor(ms.ballsLeft / 6);
+      const ballsExtra = ms.ballsLeft % 6;
+      reply = `⏱️ Overs Remaining: *${oversLeft}.${ballsExtra}* (${ms.ballsLeft} balls left)`;
+    } else if (ms?.overs) {
+      const bowled = parseFloat(ms.overs);
+      const left = (20 - bowled).toFixed(1);
+      reply = `⏱️ Overs bowled: ${ms.overs} / 20 → ~${left} overs remaining`;
+    } else {
+      reply = `Overs info not available right now, ${askerUsername}!`;
+    }
+  }
+
+  // ── leaderboard ──────────────────────────────────────────────────────────
+  else if (['top', 'leaderboard', 'standings'].includes(q)) {
+    const rows = await query(`
+      SELECT u.username, COALESCE(SUM(v.points), 0) AS pts
+      FROM users u
+      LEFT JOIN votes v ON v.user_id = u.id AND v.room_id = $1
+      WHERE u.is_bot = FALSE
+      GROUP BY u.username
+      ORDER BY pts DESC
+      LIMIT 5
+    `, [roomId]);
+    if (!rows.length) {
+      reply = `No predictions made in this room yet, ${askerUsername}!`;
+    } else {
+      const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
+      const lines = rows.map((r, i) => `${medals[i]} ${r.username} — ${r.pts} pts`);
+      reply = `🏆 Room Leaderboard (Top 5)\n\n${lines.join('\n')}`;
+    }
+  }
+
+  // ── predictions / vote split ──────────────────────────────────────────────
+  else if (['votes', 'predictions', 'vote split'].includes(q)) {
+    const rows = await query(`
+      SELECT prediction, COUNT(*)::int AS cnt
+      FROM votes
+      WHERE match_id = $1 AND room_id = $2
+      GROUP BY prediction
+    `, [matchId, roomId]);
+    if (!rows.length) {
+      reply = `No predictions yet for this match in this room, ${askerUsername}!`;
+    } else {
+      const total = rows.reduce((s, r) => s + r.cnt, 0);
+      const lines = rows.map(r => {
+        const pct = Math.round((r.cnt / total) * 100);
+        const bar = '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
+        return `${r.prediction}: ${bar} ${pct}% (${r.cnt})`;
+      });
+      reply = `📊 Vote Split for ${t1} vs ${t2}\n\n${lines.join('\n')}\nTotal votes: ${total}`;
+    }
+  }
+
+  // ── who predicted [team] ──────────────────────────────────────────────────
+  else if (q.startsWith('who predicted ') || q.startsWith('who voted for ') || q.startsWith('who picked ')) {
+    const teamQuery = q.replace(/^who (predicted|voted for|picked)\s+/i, '').toUpperCase();
+    const rows = await query(`
+      SELECT u.username FROM votes v
+      JOIN users u ON u.id = v.user_id
+      WHERE v.match_id = $1 AND v.room_id = $2 AND UPPER(v.prediction) = $3
+    `, [matchId, roomId, teamQuery]);
+    if (!rows.length) {
+      reply = `Nobody in this room picked *${teamQuery}* for this match, ${askerUsername}!`;
+    } else {
+      const names = rows.map(r => r.username).join(', ');
+      reply = `🗳️ Picked *${teamQuery}*:\n${names}`;
+    }
+  }
+
+  // ── who will win / prediction ─────────────────────────────────────────────
+  else if (['win', 'who will win', 'predict'].includes(q)) {
+    const responses = [
+      `My crystal ball says… *${t1}*! But cricket always has the last laugh 😄`,
+      `Honestly? *${t2}* looks strong today. But I've been wrong before 🤷`,
+      `If I had to bet — *${t1}* by a whisker! Don't blame me if it goes the other way 😅`,
+      `*${t2}* has the momentum right now. That's my call, ${askerUsername}! 🏏`,
+      `Too close to call! But my gut says *${t1}*. Let's see 🤞`,
+    ];
+    const matchIndex = parseInt(matchId.replace('m', ''), 10) || 0;
+    reply = responses[matchIndex % responses.length];
+    // Lean toward whoever is winning if we have live data
+    if (liveData?.status) {
+      reply += `\n\nP.S. Current status: ${liveData.status}`;
+    }
+  }
+
+  // ── unknown ───────────────────────────────────────────────────────────────
+  else {
+    reply = `Didn't catch that 🤔 Type /${botName} help`;
+  }
+
+  if (reply) {
+    await postBotMessage(roomId, matchId, reply, botName);
+  }
+}
+
+// ─── Ball-by-ball Commentary ───────────────────────────────────────────────
+
+const CRICBUZZ_COMMENTARY_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': 'application/json',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Referer': 'https://www.cricbuzz.com/',
+  'Origin': 'https://www.cricbuzz.com',
+};
+
+function formatBallMessage(ball, matchScore) {
+  if (!ball) return null;
+
+  // Over separator = end-of-over summary
+  if (ball.overSeparator) {
+    const sep = ball.overSeparator;
+    const score = sep.score != null ? `${sep.score}/${sep.wickets ?? 0}` : null;
+    const runsThisOver = sep.runs != null ? `${sep.runs} runs` : null;
+    const parts = [`━━ End of Over ${sep.overNum ?? ''} ━━`];
+    if (runsThisOver) parts.push(runsThisOver);
+    if (score) parts.push(`Score: ${score}`);
+    return parts.join('  •  ');
+  }
+
+  const event = (ball.event || '').toUpperCase();
+  const runs = String(ball.runsScored ?? '');
+  const text = (ball.commText || '').trim();
+  if (!text) return null;
+
+  // Over + ball number
+  const overStr = (ball.oversNum != null && ball.ballNbr != null)
+    ? `${ball.oversNum}.${ball.ballNbr}`
+    : null;
+
+  // Event emoji/label
+  let eventLabel = '';
+  if (event === 'WICKET') eventLabel = '🔴 WICKET!';
+  else if (runs === '6' || event === 'SIX') eventLabel = '🏏 SIX!';
+  else if (runs === '4' || event === 'BOUNDARY' || event === 'FOUR') eventLabel = '🔵 FOUR!';
+  else if (event === 'WIDE') eventLabel = '↔️ Wide';
+  else if (event === 'NO_BALL') eventLabel = '⚠️ No Ball';
+  else if (runs === '0') eventLabel = '🔒 Dot ball';
+  else eventLabel = `+${runs} run${runs === '1' ? '' : 's'}`;
+
+  // Line 1: Over + event
+  const line1 = [overStr ? `Over ${overStr}` : null, eventLabel].filter(Boolean).join('  •  ');
+
+  // Line 2: Batter vs Bowler
+  const batter = ball.batsmanStriker;
+  const bowler = ball.bowlerStriker;
+  let line2 = '';
+  if (batter || bowler) {
+    const batterStr = batter
+      ? `🏏 ${batter.batName} (${batter.batRuns ?? 0}* off ${batter.batBalls ?? 0})`
+      : null;
+    const bowlerStr = bowler
+      ? `⚾ ${bowler.bowlName} (${bowler.bowlWkts ?? 0}/${bowler.bowlRuns ?? 0})`
+      : null;
+    line2 = [batterStr, bowlerStr].filter(Boolean).join('  vs  ');
+  }
+
+  // Line 3: Team score
+  let line3 = '';
+  const teamScore = matchScore || null;
+  if (teamScore) {
+    line3 = `📊 ${teamScore}`;
+  }
+
+  // Line 4: Commentary text
+  const line4 = text;
+
+  return [line1, line2, line3, line4].filter(Boolean).join('\n');
+}
+
+async function pollCommentary() {
+  try {
+    if (commentaryCache.size === 0) return;
+
+    const existingResults = await query('SELECT match_id FROM results');
+    const completedIds = new Set(existingResults.map(r => r.match_id));
+
+    const allRooms = await query('SELECT id FROM rooms');
+    const roomIds = allRooms.map(r => r.id);
+    if (roomIds.length === 0) return;
+
+    for (const [matchId, state] of commentaryCache.entries()) {
+      if (completedIds.has(matchId) || !state.cricbuzzMatchId) continue;
+
+      try {
+        const resp = await axios.get(
+          `https://www.cricbuzz.com/api/cricket-match/${state.cricbuzzMatchId}/full-commentary/1`,
+          { headers: CRICBUZZ_COMMENTARY_HEADERS, timeout: 10000 }
+        );
+        const commentary = resp.data?.commentary || [];
+
+        // Extract team score from response-level miniscore or matchScore
+        const miniscore = resp.data?.miniscore || resp.data?.matchScore;
+        let matchScoreStr = null;
+        if (miniscore) {
+          const batting = miniscore.batTeam || miniscore.inningScore;
+          if (batting) {
+            const teamName = batting.teamSName || batting.teamId || '';
+            const score = batting.score != null ? batting.score : null;
+            const wickets = batting.wickets != null ? batting.wickets : null;
+            const overs = batting.overs != null ? batting.overs : null;
+            if (score != null) {
+              matchScoreStr = teamName
+                ? `${teamName}: ${score}/${wickets ?? 0}${overs != null ? ` (${overs} ov)` : ''}`
+                : `${score}/${wickets ?? 0}${overs != null ? ` (${overs} ov)` : ''}`;
+            }
+          }
+        }
+
+        // New balls since lastTs, ordered oldest → newest
+        const newBalls = commentary
+          .filter(b => (b.timestamp || 0) > state.lastTs)
+          .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+        if (newBalls.length === 0) continue;
+
+        const botName = getBotName(matchId);
+
+        for (const ball of newBalls) {
+          const msg = formatBallMessage(ball, matchScoreStr);
+          if (!msg) continue;
+          for (const roomId of roomIds) {
+            await postBotMessage(roomId, matchId, msg, botName);
+          }
+          state.lastTs = Math.max(state.lastTs, ball.timestamp || 0);
+        }
+
+        console.log(`[Commentary] Posted ${newBalls.length} ball(s) for match ${matchId}`);
+      } catch (e) {
+        console.error(`[Commentary] Error for match ${matchId}:`, e.message);
+      }
+    }
+  } catch (e) {
+    console.error('[Commentary] Poll error:', e.message);
+  }
+}
+
+setInterval(pollCommentary, 30 * 1000);
+setTimeout(pollCommentary, 15000);
+
+// ─── Reactions API ─────────────────────────────────────────────────────────
+
+app.post('/api/reactions', authMiddleware, asyncRoute(async (req, res) => {
+  const { messageId, emoji } = req.body;
+  if (!messageId || !emoji) return res.status(400).json({ error: 'messageId and emoji required' });
+
+  const msg = await queryOne('SELECT room_id, match_id FROM chat_messages WHERE id = $1', [messageId]);
+  if (!msg) return res.status(404).json({ error: 'Message not found' });
+
+  const existing = await queryOne(
+    'SELECT id FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3',
+    [messageId, req.user.id, emoji]
+  );
+
+  if (existing) {
+    await query('DELETE FROM message_reactions WHERE id = $1', [existing.id]);
+  } else {
+    await query(
+      'INSERT INTO message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)',
+      [messageId, req.user.id, emoji]
+    );
+  }
+
+  const reactions = await query(`
+    SELECT mr.emoji, COUNT(*)::int AS count,
+      array_agg(mr.user_id) AS user_ids,
+      array_agg(u.username) AS usernames
+    FROM message_reactions mr
+    JOIN users u ON u.id = mr.user_id
+    WHERE mr.message_id = $1
+    GROUP BY mr.emoji
+  `, [messageId]);
+
+  io.to(`chat_${msg.room_id}_${msg.match_id}`).emit('reaction_update', { messageId, reactions });
+  res.json({ ok: true, reactions });
+}));
+
+app.get("/api/health", (req, res) => {
+  res.json({ status: "alive", time: new Date() });
+});
+
+// Self-pinging mechanism to prevent backend from sleeping
+const PING_INTERVAL = 14 * 60 * 1000; // 14 minutes
+setInterval(() => {
+  const url = process.env.SERVER_URL || `http://localhost:${PORT}`;
+  axios.get(`${url}/api/health`)
+    .then(() => console.log(`[Self-Ping] Backend kept alive via ${url}`))
+    .catch((err) => console.log(`[Self-Ping] Failed to ping ${url}: ${err.message}`));
+}, PING_INTERVAL);
+
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+initDb()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`IPL Predictor API with Chat running on http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Failed to start:", err);
+    process.exit(1);
+  });
