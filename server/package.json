@@ -1,0 +1,21 @@
+{
+  "name": "ipl-predictor-server",
+  "version": "1.0.0",
+  "description": "Self-hosted backend for IPL Predictor 2026",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "axios": "^1.14.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^17.3.1",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2",
+    "openai": "^6.34.0",
+    "pg": "^8.16.3",
+    "socket.io": "^4.8.3"
+  }
+}

@@ -1,0 +1,82 @@
+import { createContext, useContext, useState, useEffect, useCallback, useLayoutEffect, type ReactNode } from "react";
+import { api, type Room } from "./api";
+import { useAuth } from "./auth";
+
+interface RoomContextType {
+  activeRoom: Room | null;
+  rooms: Room[];
+  loading: boolean;
+  setActiveRoomId: (id: number) => void;
+  refreshRooms: () => Promise<void>;
+}
+
+const RoomContext = createContext<RoomContextType | null>(null);
+
+export function RoomProvider({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  const [activeRoom, setActiveRoom] = useState<Room | null>(null);
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [loading, setLoading] = useState(() => !!user);
+
+  useLayoutEffect(() => {
+    if (!user) {
+      setRooms([]);
+      setActiveRoom(null);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+  }, [user]);
+
+  const refreshRooms = useCallback(async () => {
+    if (!user) return;
+
+    try {
+      const myRooms = await api.getMyRooms();
+      setRooms(myRooms);
+
+      const storedId = localStorage.getItem("active_room_id");
+      const preferredRoom =
+        (storedId ? myRooms.find((room) => room.id === Number(storedId)) : null) ??
+        myRooms[0] ??
+        null;
+
+      setActiveRoom(preferredRoom);
+
+      if (preferredRoom) {
+        localStorage.setItem("active_room_id", preferredRoom.id.toString());
+      } else {
+        localStorage.removeItem("active_room_id");
+      }
+    } catch (e) {
+      console.error("Failed to load rooms", e);
+    } finally {
+      setLoading(false);
+    }
+  }, [user]);
+
+  useEffect(() => {
+    refreshRooms();
+  }, [refreshRooms]);
+
+  const setActiveRoomId = (id: number) => {
+    const room = rooms.find(r => r.id === id);
+    if (room) {
+      setActiveRoom(room);
+      localStorage.setItem("active_room_id", id.toString());
+    }
+  };
+
+  return (
+    <RoomContext.Provider value={{ activeRoom, rooms, loading, setActiveRoomId, refreshRooms }}>
+      {children}
+    </RoomContext.Provider>
+  );
+}
+
+export function useRoom() {
+  const ctx = useContext(RoomContext);
+  if (!ctx) throw new Error("useRoom must be inside RoomProvider");
+  return ctx;
+}
