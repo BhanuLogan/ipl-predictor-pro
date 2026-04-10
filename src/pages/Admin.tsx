@@ -28,6 +28,7 @@ const Admin = () => {
   const [changePwStatus, setChangePwStatus] = useState("");
   const [overrides, setOverrides] = useState<Record<string, MatchOverride>>({});
   const [overrideLoading, setOverrideLoading] = useState<string | null>(null);
+  const [botSettings, setBotSettings] = useState<Record<string, boolean>>({});
   const [announcementText, setAnnouncementText] = useState("");
   const [currentAnnouncement, setCurrentAnnouncement] = useState("");
   const [announcementLoading, setAnnouncementLoading] = useState(false);
@@ -35,18 +36,22 @@ const Admin = () => {
   const loadData = async (roomId?: number) => {
     try {
       const actualRoomId = roomId ?? selectedRoomId;
-      const [r, v, rms, ovs, ann] = await Promise.all([
+      const [r, v, rms, ovs, ann, bots] = await Promise.all([
         api.getResults(),
         actualRoomId ? api.getVotes(actualRoomId) : Promise.resolve({}),
         user?.is_admin ? api.getAllRoomsAdmin() : Promise.resolve([]),
         api.getMatchOverrides(),
         api.getAnnouncement(),
+        api.getMatchBotSettings(),
       ]);
       setResults(r);
       setVotes(v);
       const ovMap: Record<string, MatchOverride> = {};
       ovs.forEach((o: MatchOverride) => { ovMap[o.match_id] = o; });
       setOverrides(ovMap);
+      const botMap: Record<string, boolean> = {};
+      bots.forEach((b: { match_id: string; bot_enabled: boolean }) => { botMap[b.match_id] = b.bot_enabled; });
+      setBotSettings(botMap);
       setCurrentAnnouncement(ann.text);
       if (user?.is_admin) {
         setRooms(rms);
@@ -157,6 +162,16 @@ const Admin = () => {
       alert("Failed to set override: " + err.message);
     } finally {
       setOverrideLoading(null);
+    }
+  };
+
+  const handleToggleBot = async (matchId: string, enabled: boolean) => {
+    setBotSettings(prev => ({ ...prev, [matchId]: enabled }));
+    try {
+      await api.setMatchBotSetting(matchId, enabled);
+    } catch (err: any) {
+      setBotSettings(prev => ({ ...prev, [matchId]: !enabled }));
+      alert("Failed to update bot setting: " + err.message);
     }
   };
 
@@ -293,7 +308,7 @@ const Admin = () => {
               
               <div className="flex items-center gap-2 bg-muted rounded-lg px-2.5 py-1 min-w-[100px]">
                 <Timer size={10} className="text-muted-foreground" />
-                <input 
+                <input
                   type="number"
                   placeholder="Delay"
                   value={override?.lock_delay || 0}
@@ -302,6 +317,24 @@ const Admin = () => {
                 />
                 <span className="text-[8px] font-bold text-muted-foreground">MIN</span>
               </div>
+            </div>
+
+            {/* Bot toggle */}
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
+                🏏 Commentary Bot
+              </span>
+              <button
+                onClick={() => handleToggleBot(match.id, !(botSettings[match.id] ?? true))}
+                className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[10px] font-bold transition-all ${
+                  (botSettings[match.id] ?? true)
+                    ? "bg-primary/20 text-primary border border-primary/30"
+                    : "bg-muted text-muted-foreground border border-border/50 hover:text-foreground"
+                }`}
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${(botSettings[match.id] ?? true) ? "bg-primary animate-pulse" : "bg-muted-foreground"}`} />
+                {(botSettings[match.id] ?? true) ? "Enabled" : "Disabled"}
+              </button>
             </div>
           </div>
         )}
@@ -553,9 +586,19 @@ const Admin = () => {
             {/* Completed Matches Section */}
             {completedMatches.length > 0 && (
               <div>
-                <h3 className="mb-3 mt-6 font-display text-lg text-secondary uppercase tracking-wide flex items-center gap-2">
-                  📜 Completed Matches
-                </h3>
+                <div className="mb-3 mt-6 flex items-center justify-between gap-3">
+                  <h3 className="font-display text-lg text-secondary uppercase tracking-wide flex items-center gap-2">
+                    📜 Completed Matches
+                  </h3>
+                  <button
+                    onClick={handleSyncResults}
+                    disabled={syncing}
+                    className="flex items-center gap-1.5 rounded-lg border border-secondary/30 bg-secondary/10 px-3 py-1.5 text-[11px] font-bold text-secondary transition-all hover:bg-secondary/20 disabled:opacity-50"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={syncing ? "animate-spin" : ""}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+                    {syncing ? "Syncing…" : "Sync with Cricbuzz"}
+                  </button>
+                </div>
                 <div className="space-y-3">
                   {completedMatches.map((match, i) => {
                     const scheduleIdx = IPL_SCHEDULE.findIndex(m => m.id === match.id);

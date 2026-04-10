@@ -1,13 +1,26 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { ArrowLeft, Send, MessageCircle } from "lucide-react";
+import { ArrowLeft, Send, MessageCircle, X } from "lucide-react";
 import { api, ChatMessage, MessageReaction, User } from "@/lib/api";
 import { connectSocket, getSocket } from "@/lib/socket";
 import Header from "@/components/Header";
 import { IPL_SCHEDULE, IPL_TEAMS } from "@/lib/data";
 import { format } from "date-fns";
 
-const REACTION_EMOJIS = ["🔥", "👏", "😮", "💔", "😂", "🏏"];
+const REACTION_EMOJIS = ["🔥", "👏", "😮", "💔", "😂", "🏏", "4️⃣", "6️⃣"];
+
+const BOT_COMMANDS = [
+  { cmd: 'score',   desc: 'Current score & status' },
+  { cmd: 'batting', desc: "Who's at the crease" },
+  { cmd: 'bowling', desc: 'Current bowler stats' },
+  { cmd: 'rr',      desc: 'Current run rate' },
+  { cmd: 'target',  desc: 'Target score' },
+  { cmd: 'rrr',     desc: 'Required run rate' },
+  { cmd: 'overs',   desc: 'Overs remaining' },
+  { cmd: 'toss',    desc: 'Toss result' },
+  { cmd: 'result',  desc: 'Final match result' },
+  { cmd: 'help',    desc: 'Show all commands' },
+];
 
 // ── Reaction bar (shown below bot messages) ──────────────────────────────────
 const ReactionBar = ({
@@ -37,58 +50,45 @@ const ReactionBar = ({
   const hasReacted = (emoji: string) =>
     reactions.find((r) => r.emoji === emoji)?.userIds?.includes(currentUserId!) ?? false;
 
+  const active = reactions.filter((r) => r.count > 0);
+
   return (
-    <div className="flex items-center gap-1 mt-1.5 flex-wrap justify-center">
-      {reactions.map((r) => {
-        const names = r.usernames ?? [];
-        const tooltipText = names.length > 0
-          ? names.length <= 3
-            ? names.join(", ")
-            : `${names.slice(0, 3).join(", ")} +${names.length - 3} more`
-          : "";
-        return (
-          <div key={r.emoji} className="relative group/reaction">
+    <div className="flex items-center gap-1 mt-1">
+      {/* Existing reactions — horizontal scroll, no wrap */}
+      {active.length > 0 && (
+        <div className="flex items-center gap-0.5 overflow-x-auto scrollbar-none max-w-[220px]">
+          {active.map((r) => (
             <button
+              key={r.emoji}
               onClick={() => onReact(messageId, r.emoji)}
-              className={`flex items-center gap-0.5 rounded-full px-2 py-0.5 text-xs border transition-all ${
+              className={`flex-shrink-0 flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[11px] border transition-all ${
                 hasReacted(r.emoji)
                   ? "bg-primary/20 border-primary/40 text-primary"
-                  : "bg-muted/60 border-border/50 text-foreground hover:bg-muted"
+                  : "bg-muted/50 border-border/40 text-foreground hover:bg-muted"
               }`}
             >
-              <span>{r.emoji}</span>
-              <span className="font-medium">{r.count}</span>
+              <span className="leading-none">{r.emoji}</span>
+              <span className="font-semibold tabular-nums">{r.count}</span>
             </button>
-            {tooltipText && (
-              <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 hidden group-hover/reaction:block z-30 pointer-events-none">
-                <div className="bg-popover border border-border rounded-lg px-2.5 py-1.5 shadow-lg text-center whitespace-nowrap">
-                  <p className="text-[10px] font-semibold text-foreground">{tooltipText}</p>
-                  <p className="text-[9px] text-muted-foreground">reacted with {r.emoji}</p>
-                </div>
-              </div>
-            )}
-          </div>
-        );
-      })}
+          ))}
+        </div>
+      )}
 
-      {/* Add reaction button */}
-      <div className="relative" ref={pickerRef}>
+      {/* Add reaction picker */}
+      <div className="relative flex-shrink-0" ref={pickerRef}>
         <button
           onClick={() => setPickerOpen((p) => !p)}
-          className="rounded-full border border-border/50 bg-muted/40 px-2 py-0.5 text-xs text-muted-foreground hover:bg-muted transition-all"
+          className="h-5 w-5 flex items-center justify-center rounded-full border border-border/50 bg-muted/40 text-[10px] text-muted-foreground hover:bg-muted transition-all leading-none"
           title="Add reaction"
         >
           +
         </button>
         {pickerOpen && (
-          <div className="absolute bottom-full left-0 mb-1 flex gap-1 bg-card border border-border rounded-xl p-1.5 shadow-xl z-20">
+          <div className="absolute bottom-full left-0 mb-1.5 grid grid-cols-4 gap-1 bg-card border border-border rounded-xl p-1.5 shadow-xl z-20 w-max">
             {REACTION_EMOJIS.map((e) => (
               <button
                 key={e}
-                onClick={() => {
-                  onReact(messageId, e);
-                  setPickerOpen(false);
-                }}
+                onClick={() => { onReact(messageId, e); setPickerOpen(false); }}
                 className="hover:scale-125 transition-transform text-base leading-none p-0.5"
               >
                 {e}
@@ -120,38 +120,100 @@ const BotMessage = ({
     msg.message.startsWith("What's up");
 
   return (
-    <div className="flex flex-col items-center my-3">
-      <div className="flex items-center gap-1.5 mb-1">
-        <span className="text-sm">🏏</span>
-        <span className="text-[10px] font-bold text-amber-400/90 uppercase tracking-widest">
-          {msg.bot_name || "ScoreBot"}
-        </span>
-        <span className="text-[9px] text-muted-foreground/50">
-          {format(new Date(msg.created_at), "h:mm a")}
-        </span>
+    <div className="flex gap-2.5 mt-4">
+      {/* Bot avatar */}
+      <div className="h-8 w-8 rounded-full flex-shrink-0 overflow-hidden border-2 border-amber-500/40 shadow-sm">
+        <img src="/bot-avatar.svg" alt="bot" className="h-full w-full object-cover" />
       </div>
 
-      <div
-        className={`max-w-[92%] sm:max-w-[75%] rounded-2xl px-4 py-2.5 text-center ${
-          isIntro
-            ? "bg-amber-500/10 border border-amber-500/25 shadow-sm"
-            : "bg-muted/50 border border-border/40"
-        }`}
-      >
-        <p className="text-sm text-foreground whitespace-pre-wrap leading-relaxed break-words">
-          {msg.message}
-        </p>
-      </div>
+      <div className="flex flex-col max-w-[85%] sm:max-w-[72%]">
+        {/* Name + time */}
+        <div className="flex items-center gap-1.5 px-1 mb-1">
+          <span className="text-[10px] font-bold text-amber-400 uppercase tracking-widest">
+            {msg.bot_name || "ScoreBot"}
+          </span>
+          <span className="text-[9px] text-muted-foreground/50">
+            {format(new Date(msg.created_at), "h:mm a")}
+          </span>
+        </div>
 
-      <ReactionBar
-        messageId={msg.id}
-        reactions={reactions}
-        currentUserId={currentUserId}
-        onReact={onReact}
-      />
+        {/* Bubble */}
+        <div
+          className={`rounded-2xl rounded-tl-none px-4 py-2.5 ${
+            isIntro
+              ? "bg-amber-500/10 border border-amber-500/25 shadow-sm"
+              : "bg-muted/50 border border-border/40"
+          }`}
+        >
+          <p className="text-sm text-foreground whitespace-pre-wrap leading-relaxed break-words">
+            {msg.message}
+          </p>
+        </div>
+
+        {/* Reactions */}
+        <div className="mt-1 pl-1">
+          <ReactionBar
+            messageId={msg.id}
+            reactions={reactions}
+            currentUserId={currentUserId}
+            onReact={onReact}
+          />
+        </div>
+      </div>
     </div>
   );
 };
+
+// ── Seen Avatars (shown below last-seen message) ─────────────────────────────
+type SeenEntry = { userId: number; username: string; profilePic: string | null; messageId: number };
+
+const SeenAvatars = ({ seenBy, currentUserId }: { seenBy: SeenEntry[]; currentUserId?: number }) => {
+  const others = seenBy.filter(s => s.userId !== currentUserId);
+  if (!others.length) return null;
+  return (
+    <div className="flex items-center gap-0.5 mt-0.5">
+      {others.slice(0, 5).map(s => (
+        <div
+          key={s.userId}
+          title={`Seen by ${s.username}`}
+          className="h-4 w-4 rounded-full bg-primary/20 border border-background flex items-center justify-center overflow-hidden flex-shrink-0"
+        >
+          {s.profilePic ? (
+            <img src={s.profilePic} alt={s.username} className="h-full w-full object-cover" />
+          ) : (
+            <span className="text-[7px] font-bold text-primary leading-none">
+              {s.username.substring(0, 2).toUpperCase()}
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// ── Render message text with @mentions highlighted ───────────────────────────
+function renderWithMentions(text: string, currentUsername?: string) {
+  const parts = text.split(/(@\w+)/g);
+  return parts.map((part, i) => {
+    if (/^@\w+$/.test(part)) {
+      const mentioned = part.slice(1);
+      const isMe = mentioned.toLowerCase() === currentUsername?.toLowerCase();
+      return (
+        <span
+          key={i}
+          className={`font-bold rounded px-0.5 ${
+            isMe
+              ? "text-amber-300 bg-amber-400/15"
+              : "text-primary"
+          }`}
+        >
+          {part}
+        </span>
+      );
+    }
+    return <span key={i}>{part}</span>;
+  });
+}
 
 // ── Main ChatRoom ─────────────────────────────────────────────────────────────
 const ChatRoom: React.FC = () => {
@@ -163,7 +225,17 @@ const ChatRoom: React.FC = () => {
   const [onlineUsers, setOnlineUsers] = useState<any[]>([]);
   const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
   const [reactions, setReactions] = useState<Record<number, MessageReaction[]>>({});
+  const [botEnabled, setBotEnabled] = useState<boolean>(true);
+  const [suggestions, setSuggestions] = useState<typeof BOT_COMMANDS>([]);
+  const [selectedSuggestion, setSelectedSuggestion] = useState(-1);
+  // seen: messageId -> array of users who last-seen this message
+  const [seenState, setSeenState] = useState<Record<number, SeenEntry[]>>({});
+  // @mention state
+  const [roomMembers, setRoomMembers] = useState<string[]>([]);
+  const [mentionSuggestions, setMentionSuggestions] = useState<string[]>([]);
+  const [selectedMention, setSelectedMention] = useState(-1);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   const match = IPL_SCHEDULE.find((m) => m.id === matchId);
   const t1 = match ? IPL_TEAMS[match.team1] : null;
@@ -191,10 +263,19 @@ const ChatRoom: React.FC = () => {
 
     if (!roomId || !matchId) return;
 
-    // Load history
+    // Load history, bot setting, and room members
     api.getChatHistory(Number(roomId), matchId).then((msgs) => {
       setMessages(msgs);
       mergeReactions(msgs);
+    }).catch(console.error);
+
+    api.getMatchBotSettings().then((settings) => {
+      const s = settings.find((s) => s.match_id === matchId);
+      setBotEnabled(s ? s.bot_enabled : true);
+    }).catch(console.error);
+
+    api.getRoom(Number(roomId)).then((room) => {
+      setRoomMembers(room.members ?? []);
     }).catch(console.error);
 
     // Socket setup
@@ -215,14 +296,147 @@ const ChatRoom: React.FC = () => {
       setReactions((prev) => ({ ...prev, [messageId]: updated }));
     });
 
+    socket.on("bot_settings_update", ({ matchId: mid, bot_enabled }: { matchId: string; bot_enabled: boolean }) => {
+      if (mid === matchId) setBotEnabled(bot_enabled);
+    });
+
+    socket.on("seen_update", ({ seenBy }: { seenBy: SeenEntry[] }) => {
+      // Rebuild messageId -> viewers map
+      const map: Record<number, SeenEntry[]> = {};
+      for (const entry of seenBy) {
+        if (!map[entry.messageId]) map[entry.messageId] = [];
+        map[entry.messageId].push(entry);
+      }
+      setSeenState(map);
+    });
+
     return () => {
       socket.off("new_message");
       socket.off("online_users");
       socket.off("reaction_update");
+      socket.off("bot_settings_update");
+      socket.off("seen_update");
     };
   }, [roomId, matchId, navigate, mergeReactions]);
 
-  useEffect(() => { scrollToBottom(); }, [messages, scrollToBottom]);
+  useEffect(() => {
+    scrollToBottom();
+    // Mark the latest message as seen
+    if (messages.length > 0 && roomId && matchId) {
+      const latest = messages[messages.length - 1];
+      const socket = getSocket();
+      if (socket) {
+        socket.emit("mark_seen", { roomId: Number(roomId), matchId, messageId: latest.id });
+      }
+    }
+  }, [messages, scrollToBottom, roomId, matchId]);
+
+  // Auto-suggest bot commands when user types /
+  useEffect(() => {
+    if (!newMessage.startsWith('/') || !botEnabled) {
+      setSuggestions([]);
+      setSelectedSuggestion(-1);
+      return;
+    }
+    const typed = newMessage.slice(1).toLowerCase();
+    const filtered = typed === ''
+      ? BOT_COMMANDS
+      : BOT_COMMANDS.filter((c) => c.cmd.startsWith(typed));
+    setSuggestions(filtered);
+    setSelectedSuggestion(-1);
+  }, [newMessage, botEnabled]);
+
+  const applySuggestion = useCallback((cmd: string) => {
+    setNewMessage(`/${cmd}`);
+    setSuggestions([]);
+    setSelectedSuggestion(-1);
+    inputRef.current?.focus();
+  }, []);
+
+  // Detect @mention context: find the @word immediately before the cursor
+  const getMentionContext = (value: string, cursorPos: number): string | null => {
+    const before = value.slice(0, cursorPos);
+    const match = before.match(/@(\w*)$/);
+    return match ? match[1] : null;
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    setNewMessage(val);
+
+    const cursor = e.target.selectionStart ?? val.length;
+    const partial = getMentionContext(val, cursor);
+
+    if (partial !== null && roomMembers.length > 0) {
+      const filtered = roomMembers.filter(
+        (m) => m.toLowerCase().startsWith(partial.toLowerCase()) && m !== user?.username
+      );
+      setMentionSuggestions(filtered);
+      setSelectedMention(-1);
+    } else {
+      setMentionSuggestions([]);
+    }
+  };
+
+  const applyMention = useCallback((username: string) => {
+    const cursor = inputRef.current?.selectionStart ?? newMessage.length;
+    const before = newMessage.slice(0, cursor);
+    const after = newMessage.slice(cursor);
+    const atIdx = before.lastIndexOf('@');
+    const replaced = `${before.slice(0, atIdx)}@${username} ${after}`;
+    setNewMessage(replaced);
+    setMentionSuggestions([]);
+    setSelectedMention(-1);
+    // Move cursor after the inserted mention
+    setTimeout(() => {
+      const pos = atIdx + username.length + 2; // @ + name + space
+      inputRef.current?.setSelectionRange(pos, pos);
+      inputRef.current?.focus();
+    }, 0);
+  }, [newMessage]);
+
+  const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    // Mention suggestions take priority
+    if (mentionSuggestions.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSelectedMention((i) => (i + 1) % mentionSuggestions.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSelectedMention((i) => (i - 1 + mentionSuggestions.length) % mentionSuggestions.length);
+        return;
+      }
+      if ((e.key === 'Tab' || e.key === 'Enter') && selectedMention >= 0) {
+        e.preventDefault();
+        applyMention(mentionSuggestions[selectedMention]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        setMentionSuggestions([]);
+        setSelectedMention(-1);
+        return;
+      }
+    }
+
+    // Bot command suggestions
+    if (suggestions.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSelectedSuggestion((i) => (i + 1) % suggestions.length);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSelectedSuggestion((i) => (i - 1 + suggestions.length) % suggestions.length);
+      } else if ((e.key === 'Tab' || e.key === 'Enter') && selectedSuggestion >= 0) {
+        e.preventDefault();
+        applySuggestion(suggestions[selectedSuggestion].cmd);
+      } else if (e.key === 'Escape') {
+        setSuggestions([]);
+        setSelectedSuggestion(-1);
+      }
+    }
+  };
 
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();
@@ -236,6 +450,10 @@ const ChatRoom: React.FC = () => {
     });
     setNewMessage("");
     setReplyingTo(null);
+    setSuggestions([]);
+    setSelectedSuggestion(-1);
+    setMentionSuggestions([]);
+    setSelectedMention(-1);
   };
 
   const handleReact = useCallback(async (messageId: number, emoji: string) => {
@@ -244,7 +462,7 @@ const ChatRoom: React.FC = () => {
     setReactions((prev) => {
       const current = prev[messageId] || [];
       const existing = current.find((r) => r.emoji === emoji);
-      const alreadyReacted = existing?.userIds.includes(user.id);
+      const alreadyReacted = existing?.userIds?.includes(user.id) ?? false;
       if (alreadyReacted) {
         return {
           ...prev,
@@ -254,8 +472,8 @@ const ChatRoom: React.FC = () => {
                 ? {
                     ...r,
                     count: r.count - 1,
-                    userIds: r.userIds.filter((id) => id !== user.id),
-                    usernames: r.usernames.filter((n) => n !== user.username),
+                    userIds: (r.userIds ?? []).filter((id) => id !== user.id),
+                    usernames: (r.usernames ?? []).filter((n) => n !== user.username),
                   }
                 : r
             )
@@ -270,8 +488,8 @@ const ChatRoom: React.FC = () => {
                 ? {
                     ...r,
                     count: r.count + 1,
-                    userIds: [...r.userIds, user.id],
-                    usernames: [...r.usernames, user.username],
+                    userIds: [...(r.userIds ?? []), user.id],
+                    usernames: [...(r.usernames ?? []), user.username],
                   }
                 : r
             )
@@ -306,9 +524,17 @@ const ChatRoom: React.FC = () => {
               <h1 className="font-display text-base font-bold leading-none truncate">
                 {t1.short} vs {t2.short}
               </h1>
-              <div className="flex items-center gap-1.5 mt-0.5">
+              <div className="flex items-center gap-2 mt-0.5">
                 <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse flex-shrink-0" />
                 <span className="text-[10px] uppercase tracking-widest text-muted-foreground font-medium">Live Chat</span>
+                <span className={`flex items-center gap-1 text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full border ${
+                  botEnabled
+                    ? "text-primary border-primary/30 bg-primary/10"
+                    : "text-muted-foreground border-border/40 bg-muted/40"
+                }`}>
+                  <span className={`h-1 w-1 rounded-full ${botEnabled ? "bg-primary animate-pulse" : "bg-muted-foreground"}`} />
+                  Bot {botEnabled ? "On" : "Off"}
+                </span>
               </div>
             </div>
           </div>
@@ -415,12 +641,26 @@ const ChatRoom: React.FC = () => {
                       </div>
                     )}
                     <div className="flex flex-wrap items-end gap-x-3 gap-y-1">
-                      <p className="text-sm leading-relaxed whitespace-pre-wrap break-words flex-1 min-w-[50px]">{msg.message}</p>
+                      <p className="text-sm leading-relaxed whitespace-pre-wrap break-words flex-1 min-w-[50px]">
+                        {renderWithMentions(msg.message, user?.username)}
+                      </p>
                       <span className={`text-[9px] whitespace-nowrap opacity-60 ml-auto pb-0.5 ${isMe ? "text-primary-foreground" : "text-muted-foreground"}`}>
                         {format(new Date(msg.created_at), "h:mm a")}
                       </span>
                     </div>
                   </div>
+                  <ReactionBar
+                    messageId={msg.id}
+                    reactions={reactions[msg.id] || []}
+                    currentUserId={user?.id}
+                    onReact={handleReact}
+                  />
+                  {/* Seen avatars */}
+                  {seenState[msg.id]?.length > 0 && (
+                    <div className={`flex ${isMe ? "justify-end" : "justify-start"} px-1`}>
+                      <SeenAvatars seenBy={seenState[msg.id]} currentUserId={user?.id} />
+                    </div>
+                  )}
                 </div>
               </div>
             );
@@ -446,12 +686,37 @@ const ChatRoom: React.FC = () => {
               </button>
             </div>
           )}
+          {/* @mention — horizontal scrollable pill row */}
+          {mentionSuggestions.length > 0 && (
+            <div className="mb-1 flex items-center gap-2 overflow-x-auto scrollbar-none py-1 animate-in slide-in-from-bottom-2 duration-150">
+              {mentionSuggestions.map((name, i) => (
+                <button
+                  key={name}
+                  type="button"
+                  onMouseDown={(e) => { e.preventDefault(); applyMention(name); }}
+                  className={`flex-shrink-0 flex items-center gap-1.5 rounded-full px-2.5 py-1 border text-xs font-semibold transition-all ${
+                    i === selectedMention
+                      ? "bg-primary text-primary-foreground border-primary shadow-sm"
+                      : "bg-muted/60 border-border/60 text-foreground hover:bg-muted hover:border-primary/40"
+                  }`}
+                >
+                  <div className="h-5 w-5 rounded-full bg-primary/25 flex items-center justify-center text-[8px] font-bold text-primary flex-shrink-0 leading-none">
+                    {name.substring(0, 2).toUpperCase()}
+                  </div>
+                  @{name}
+                </button>
+              ))}
+            </div>
+          )}
+
           <div className="flex gap-2">
             <input
+              ref={inputRef}
               type="text"
               value={newMessage}
-              onChange={(e) => setNewMessage(e.target.value)}
-              placeholder={replyingTo ? "Type your reply..." : "Chat or /BotName score, /BotName help..."}
+              onChange={handleInputChange}
+              onKeyDown={handleInputKeyDown}
+              placeholder={replyingTo ? "Type your reply..." : botEnabled ? "Chat or @mention, /score, /help..." : "Chat or @mention someone..."}
               className="flex-1 rounded-xl border border-border bg-muted px-4 py-3 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
               maxLength={500}
             />
@@ -466,6 +731,51 @@ const ChatRoom: React.FC = () => {
           </div>
         </form>
       </div>
+
+      {/* Bot command sidebar */}
+      {suggestions.length > 0 && matchId && (
+        <>
+          {/* Backdrop (mobile only) */}
+          <div
+            className="fixed inset-0 z-30 bg-black/30 sm:hidden"
+            onClick={() => { setSuggestions([]); setSelectedSuggestion(-1); }}
+          />
+          <div className="fixed inset-y-0 right-0 z-40 flex flex-col w-64 bg-card border-l border-border shadow-2xl animate-in slide-in-from-right duration-200">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-muted/40 flex-shrink-0">
+              <span className="text-[11px] font-bold uppercase tracking-widest text-amber-400">
+                Bot commands
+              </span>
+              <button
+                onClick={() => { setSuggestions([]); setSelectedSuggestion(-1); }}
+                className="p-1 rounded-lg hover:bg-muted transition-colors text-muted-foreground"
+              >
+                <X size={13} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
+              {suggestions.map((s, i) => (
+                <button
+                  key={s.cmd}
+                  onMouseDown={(e) => { e.preventDefault(); applySuggestion(s.cmd); }}
+                  className={`w-full flex flex-col gap-0.5 px-3 py-2.5 rounded-lg text-left transition-colors ${
+                    i === selectedSuggestion
+                      ? "bg-primary/10 border border-primary/20"
+                      : "hover:bg-muted/60 border border-transparent"
+                  }`}
+                >
+                  <code className="text-[11px] font-mono font-bold text-amber-400">
+                    /{s.cmd}
+                  </code>
+                  <span className="text-[11px] text-muted-foreground leading-snug">{s.desc}</span>
+                </button>
+              ))}
+            </div>
+            <div className="px-4 py-2 border-t border-border/50 bg-muted/20 flex-shrink-0">
+              <p className="text-[9px] text-muted-foreground">↑↓ navigate · Tab / Enter to pick · Esc to close</p>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 };
